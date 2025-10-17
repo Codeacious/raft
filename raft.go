@@ -31,6 +31,8 @@ import (
 	"go.etcd.io/raft/v3/tracker"
 )
 
+const ReadLeaseWallTimeInMicros = 500000
+
 const (
 	// None is a placeholder node ID used when there is no leader.
 	None uint64 = 0
@@ -65,6 +67,9 @@ const (
 	// should (clock can move backward/pause without any bound). ReadIndex is not safe
 	// in that case.
 	ReadOnlyLeaseBased
+	// New value for allowing read-leases. Leader can still answer reads as with ReadOnlyLeaseBased,
+	// but now leaders can grant read-leases to followers that ask for them.
+	ReadOnlyGrantLeases
 )
 
 // Possible values for CampaignType
@@ -241,6 +246,11 @@ type Config struct {
 	// CheckQuorum MUST be enabled if ReadOnlyOption is ReadOnlyLeaseBased.
 	ReadOnlyOption ReadOnlyOption
 
+	// AskForReadLease enables this node to ask for read leases from the leader
+	// when it is a follower. This is only allowed when ReadOnlyOption is
+	// ReadOnlyGrantLeases.
+	AskForReadLease bool
+
 	// Logger is the logger used for raft log. For multinode which can host
 	// multiple raft group, each raft group can have its own logger
 	Logger Logger
@@ -331,8 +341,8 @@ func (c *Config) validate() error {
 		c.Logger = getLogger()
 	}
 
-	if c.ReadOnlyOption == ReadOnlyLeaseBased && !c.CheckQuorum {
-		return errors.New("CheckQuorum must be enabled when ReadOnlyOption is ReadOnlyLeaseBased")
+	if (c.ReadOnlyOption == ReadOnlyLeaseBased || c.ReadOnlyOption == ReadOnlyGrantLeases) && !c.CheckQuorum {
+		return errors.New("CheckQuorum must be enabled when ReadOnlyOption is ReadOnlyLeaseBased or ReadOnlyGrantLeases")
 	}
 
 	return nil
@@ -541,7 +551,7 @@ func (r *raft) send(m pb.Message) {
 			m.Term = r.Term
 		}
 	}
-	if m.Type == pb.MsgAppResp || m.Type == pb.MsgVoteResp || m.Type == pb.MsgPreVoteResp {
+	if m.Type == pb.MsgAppResp || m.Type == pb.MsgVoteResp || m.Type == pb.MsgPreVoteResp || m.Type == pb.MsgAskReadLease {
 		// If async storage writes are enabled, messages added to the msgs slice
 		// are allowed to be sent out before unstable state (e.g. log entry
 		// writes and election votes) have been durably synced to the local
@@ -587,6 +597,11 @@ func (r *raft) send(m pb.Message) {
 		// because the safety of such behavior has not been formally verified,
 		// we err on the side of safety and omit a `&& !m.Reject` condition
 		// above.
+		//
+		// This also must be done for MsgAskReadLease messages, as the committed
+		// index must be applied before a node should ask for a read lease at that index.
+		// (And, leaders will not grant read leases that are not for the current commit index.)
+
 		r.msgsAfterAppend = append(r.msgsAfterAppend, m)
 		traceSendMessage(r, &m)
 	} else {
@@ -1659,6 +1674,8 @@ func stepLeader(r *raft, m pb.Message) error {
 		} else {
 			r.sendAppend(leadTransferee)
 		}
+	case pb.MsgAskReadLease:
+		r.logger.Infof("Got MsgAskReadLease from %x at leader", m.From)
 	}
 	return nil
 }
@@ -1742,8 +1759,8 @@ func stepFollower(r *raft, m pb.Message) error {
 		m.To = r.lead
 		r.send(m)
 	case pb.MsgForgetLeader:
-		if r.readOnly.option == ReadOnlyLeaseBased {
-			r.logger.Error("ignoring MsgForgetLeader due to ReadOnlyLeaseBased")
+		if r.readOnly.option == ReadOnlyLeaseBased || r.readOnly.option == ReadOnlyGrantLeases {
+			r.logger.Error("ignoring MsgForgetLeader due to ReadOnlyLeaseBased or ReadOnlyGrantLeases")
 			return nil
 		}
 		if r.lead != None {
@@ -1761,8 +1778,25 @@ func stepFollower(r *raft, m pb.Message) error {
 			r.logger.Infof("%x no leader at term %d; dropping index reading msg", r.id, r.Term)
 			return nil
 		}
-		m.To = r.lead
-		r.send(m)
+		if r.readOnly.option == ReadOnlyGrantLeases {
+			if r.readOnly.hasActiveReadLease() {
+				resp := r.responseToReadIndexReq(m, r.raftLog.committed) // TODO: Maybe not r.raftLog.committed
+				resp.From = r.id
+				r.send(resp)
+			} else {
+				leaseReq := ReadLease{NodeId: r.id, Duration: ReadLeaseWallTimeInMicros, LogIndex: r.raftLog.committed}
+				leaseCtx := leaseReq.Marshal()
+				// TODO: Send this with a request ctx and timeout instead of on every read
+				lreq := pb.Message{From: r.id, To: r.lead, Type: pb.MsgAskReadLease, Entries: []pb.Entry{{Data: leaseCtx}}}
+				r.send(lreq)
+				// Still forward to the leader since we have no lease
+				m.To = r.lead
+				r.send(m)
+			}
+		} else {
+			m.To = r.lead
+			r.send(m)
+		}
 	case pb.MsgReadIndexResp:
 		if len(m.Entries) != 1 {
 			r.logger.Errorf("%x invalid format of MsgReadIndexResp from %x, entries count: %d", r.id, m.From, len(m.Entries))
@@ -2151,6 +2185,10 @@ func sendMsgReadIndexResponse(r *raft, m pb.Message) {
 		r.readOnly.recvAck(r.id, m.Entries[0].Data)
 		r.bcastHeartbeatWithCtx(m.Entries[0].Data)
 	case ReadOnlyLeaseBased:
+		if resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.To != None {
+			r.send(resp)
+		}
+	case ReadOnlyGrantLeases:
 		if resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.To != None {
 			r.send(resp)
 		}

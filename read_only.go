@@ -14,7 +14,12 @@
 
 package raft
 
-import pb "go.etcd.io/raft/v3/raftpb"
+import (
+	"encoding/binary"
+	"fmt"
+
+	pb "go.etcd.io/raft/v3/raftpb"
+)
 
 // ReadState provides state for read only query.
 // It's caller's responsibility to call ReadIndex first before getting
@@ -24,6 +29,31 @@ import pb "go.etcd.io/raft/v3/raftpb"
 type ReadState struct {
 	Index      uint64
 	RequestCtx []byte
+}
+
+type ReadLease struct {
+	NodeId   uint64
+	LogIndex uint64
+	Duration uint64
+}
+
+func (rl *ReadLease) Marshal() []byte {
+	buf := make([]byte, 24)
+	binary.BigEndian.PutUint64(buf[0:8], rl.NodeId)
+	binary.BigEndian.PutUint64(buf[8:16], rl.LogIndex)
+	binary.BigEndian.PutUint64(buf[16:24], rl.Duration)
+	return buf
+}
+
+func UnmarshalReadLease(data []byte) (*ReadLease, error) {
+	if len(data) != 24 {
+		return nil, fmt.Errorf("invalid ReadLease data length: got %d, want 24", len(data))
+	}
+	return &ReadLease{
+		NodeId:   binary.BigEndian.Uint64(data[0:8]),
+		LogIndex: binary.BigEndian.Uint64(data[8:16]),
+		Duration: binary.BigEndian.Uint64(data[16:24]),
+	}, nil
 }
 
 type readIndexStatus struct {
@@ -40,6 +70,7 @@ type readOnly struct {
 	option           ReadOnlyOption
 	pendingReadIndex map[string]*readIndexStatus
 	readIndexQueue   []string
+	readLeaseInfo    []ReadLease
 }
 
 func newReadOnly(option ReadOnlyOption) *readOnly {
@@ -47,6 +78,10 @@ func newReadOnly(option ReadOnlyOption) *readOnly {
 		option:           option,
 		pendingReadIndex: make(map[string]*readIndexStatus),
 	}
+}
+
+func (ro *readOnly) hasActiveReadLease() bool {
+	return false
 }
 
 // addRequest adds a read only request into readonly struct.

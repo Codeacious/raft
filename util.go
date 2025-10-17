@@ -36,6 +36,7 @@ var isLocalMsg = [...]bool{
 	pb.MsgStorageAppendResp: true,
 	pb.MsgStorageApply:      true,
 	pb.MsgStorageApplyResp:  true,
+	pb.MsgAskReadLease:      true,
 }
 
 var isResponseMsg = [...]bool{
@@ -47,6 +48,7 @@ var isResponseMsg = [...]bool{
 	pb.MsgPreVoteResp:       true,
 	pb.MsgStorageAppendResp: true,
 	pb.MsgStorageApplyResp:  true,
+	pb.MsgAskReadLeaseResp:  true,
 }
 
 func isMsgInArray(msgt pb.MessageType, arr []bool) bool {
