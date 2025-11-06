@@ -97,7 +97,6 @@ func TestIsLocalMsg(t *testing.T) {
 		{pb.MsgStorageAppendResp, true},
 		{pb.MsgStorageApply, true},
 		{pb.MsgStorageApplyResp, true},
-		{pb.MsgAskReadLease, true},
 	}
 
 	for _, tt := range tests {

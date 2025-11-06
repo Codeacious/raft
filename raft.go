@@ -31,8 +31,6 @@ import (
 	"go.etcd.io/raft/v3/tracker"
 )
 
-const ReadLeaseWallTimeInMicros = 500000
-
 const (
 	// None is a placeholder node ID used when there is no leader.
 	None uint64 = 0
@@ -238,13 +236,29 @@ type Config struct {
 	// ReadOnlySafe guarantees the linearizability of the read only request by
 	// communicating with the quorum. It is the default and suggested option.
 	//
-	// ReadOnlyLeaseBased ensures linearizability of the read only request by
+	// ReadOnlyLeaseBased/ReadOnlyGrantLeases ensures linearizability of the read only request by
 	// relying on the leader lease. It can be affected by clock drift.
 	// If the clock drift is unbounded, leader might keep the lease longer than it
 	// should (clock can move backward/pause without any bound). ReadIndex is not safe
 	// in that case.
-	// CheckQuorum MUST be enabled if ReadOnlyOption is ReadOnlyLeaseBased.
+	// CheckQuorum MUST be enabled if ReadOnlyOption is ReadOnlyLeaseBased or ReadOnlyGrantLeases.
 	ReadOnlyOption ReadOnlyOption
+
+	// ReadLeaseDurationMicros is only used if ReadOnlyOption is ReadOnlyGrantLeases.
+	// In this case, it represents how long a read lease can be in microseconds.
+	// This allows new leaders during partitions to know how long
+	// they must wait (i.e. commit nothing to the log) after becoming leader
+	// such that all previous read leases will have expired.
+	// This is necessary to guarantee linearizability with read leases,
+	// and as such must be in the Raft config.
+	//
+	// A leader will also delay Append operations to the log if a read-lease holder
+	// stops responding until the lease expires, as determined by this value.
+	ReadLeaseDurationMicros uint64
+
+	// MaxNumReadLeases is the limit for the number of read leases that can be active
+	// at any given time. This is only used if ReadOnlyOption is ReadOnlyGrantLeases.
+	MaxNumReadLeases int
 
 	// AskForReadLease enables this node to ask for read leases from the leader
 	// when it is a follower. This is only allowed when ReadOnlyOption is
@@ -343,6 +357,10 @@ func (c *Config) validate() error {
 
 	if (c.ReadOnlyOption == ReadOnlyLeaseBased || c.ReadOnlyOption == ReadOnlyGrantLeases) && !c.CheckQuorum {
 		return errors.New("CheckQuorum must be enabled when ReadOnlyOption is ReadOnlyLeaseBased or ReadOnlyGrantLeases")
+	}
+
+	if c.ReadOnlyOption == ReadOnlyGrantLeases && (c.ReadLeaseDurationMicros == 0 || c.MaxNumReadLeases <= 0) {
+		return errors.New("must set ReadLeaseDurationMicros and MaxNumReadLeases when using ReadOnlyGrantLeases")
 	}
 
 	return nil
@@ -455,19 +473,20 @@ func newRaft(c *Config) *raft {
 	}
 
 	r := &raft{
-		id:                          c.ID,
-		lead:                        None,
-		isLearner:                   false,
-		raftLog:                     raftlog,
-		maxMsgSize:                  entryEncodingSize(c.MaxSizePerMsg),
-		maxUncommittedSize:          entryPayloadSize(c.MaxUncommittedEntriesSize),
-		trk:                         tracker.MakeProgressTracker(c.MaxInflightMsgs, c.MaxInflightBytes),
-		electionTimeout:             c.ElectionTick,
-		heartbeatTimeout:            c.HeartbeatTick,
-		logger:                      c.Logger,
-		checkQuorum:                 c.CheckQuorum,
-		preVote:                     c.PreVote,
-		readOnly:                    newReadOnly(c.ReadOnlyOption),
+		id:                 c.ID,
+		lead:               None,
+		isLearner:          false,
+		raftLog:            raftlog,
+		maxMsgSize:         entryEncodingSize(c.MaxSizePerMsg),
+		maxUncommittedSize: entryPayloadSize(c.MaxUncommittedEntriesSize),
+		trk:                tracker.MakeProgressTracker(c.MaxInflightMsgs, c.MaxInflightBytes),
+		electionTimeout:    c.ElectionTick,
+		heartbeatTimeout:   c.HeartbeatTick,
+		logger:             c.Logger,
+		checkQuorum:        c.CheckQuorum,
+		preVote:            c.PreVote,
+		readOnly: newReadOnly(c.ReadOnlyOption, c.ReadLeaseDurationMicros,
+			c.MaxNumReadLeases, c.AskForReadLease),
 		disableProposalForwarding:   c.DisableProposalForwarding,
 		disableConfChangeValidation: c.DisableConfChangeValidation,
 		stepDownOnRemoval:           c.StepDownOnRemoval,
@@ -824,7 +843,8 @@ func (r *raft) reset(term uint64) {
 
 	r.pendingConfIndex = 0
 	r.uncommittedSize = 0
-	r.readOnly = newReadOnly(r.readOnly.option)
+	r.readOnly = newReadOnly(r.readOnly.option, r.readOnly.readLeaseDuration,
+		r.readOnly.maxReadLeases, r.readOnly.shouldAskForLease)
 }
 
 func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
@@ -1676,6 +1696,29 @@ func stepLeader(r *raft, m pb.Message) error {
 		}
 	case pb.MsgAskReadLease:
 		r.logger.Infof("Got MsgAskReadLease from %x at leader", m.From)
+		// leaseReq, err := UnmarshalReadLease(m.Entries[0].Data)
+		// if err != nil {
+		// 	r.logger.Warningf("failed to unmarshal read lease request from %x: %v", m.From, err)
+		// 	return nil
+		// }
+
+		// First, check if we have an active read list for this node.
+		// TODO: Do that, checking against readLeaseInfo in r.readOnly.
+
+		resp := pb.Message{To: m.From, From: r.id, Type: pb.MsgAskReadLeaseResp,
+			Term: r.Term, Index: r.raftLog.committed,
+			Entries: []pb.Entry{{}}} // TODO: Fill entry with read lease info.
+		// There are three requirements to grant a read lease:
+		if r.Term == m.Term && // 1. The request is for the current term.
+			r.raftLog.committed <= m.Index && // 2. The follower has an up-to-date log. TODO: Allow a marginal gap
+			r.readOnly.getNumReadLeases() < r.readOnly.maxReadLeases { // 3. We have read leases available.
+			readLease := r.readOnly.grantNewLease(m.From, r.raftLog.committed)
+			resp.Reject = false
+			resp.Entries[0].Data = readLease.Marshal()
+		} else {
+			resp.Reject = true
+		}
+		r.send(resp)
 	}
 	return nil
 }
@@ -1779,16 +1822,19 @@ func stepFollower(r *raft, m pb.Message) error {
 			return nil
 		}
 		if r.readOnly.option == ReadOnlyGrantLeases {
-			if r.readOnly.hasActiveReadLease() {
+			if r.readOnly.hasActiveReadLease(r.id) {
 				resp := r.responseToReadIndexReq(m, r.raftLog.committed) // TODO: Maybe not r.raftLog.committed
 				resp.From = r.id
 				r.send(resp)
 			} else {
-				leaseReq := ReadLease{NodeId: r.id, Duration: ReadLeaseWallTimeInMicros, LogIndex: r.raftLog.committed}
-				leaseCtx := leaseReq.Marshal()
+				// leaseReq := ReadLease{NodeId: r.id, Duration: ReadLeaseWallTimeInMicros, LogIndex: r.raftLog.committed}
+				// leaseCtx := leaseReq.Marshal()
 				// TODO: Send this with a request ctx and timeout instead of on every read
-				lreq := pb.Message{From: r.id, To: r.lead, Type: pb.MsgAskReadLease, Entries: []pb.Entry{{Data: leaseCtx}}}
-				r.send(lreq)
+				if r.readOnly.shouldAskForLease {
+					lreq := pb.Message{From: r.id, To: r.lead, Term: r.Term, Index: r.raftLog.committed, Type: pb.MsgAskReadLease}
+					r.send(lreq)
+					r.logger.Infof("%x sending MsgAskReadLease to leader %x", r.id, r.lead)
+				}
 				// Still forward to the leader since we have no lease
 				m.To = r.lead
 				r.send(m)
@@ -1803,6 +1849,28 @@ func stepFollower(r *raft, m pb.Message) error {
 			return nil
 		}
 		r.readStates = append(r.readStates, ReadState{Index: m.Index, RequestCtx: m.Entries[0].Data})
+	case pb.MsgAskReadLeaseResp:
+		if len(m.Entries) != 1 {
+			r.logger.Errorf("%x invalid format of MsgAskReadLeaseResp from %x, entries count: %d", r.id, m.From, len(m.Entries))
+			return nil
+		}
+		if m.Reject {
+			r.logger.Infof("%x's request for read lease was rejected by leader %x", r.id, m.From)
+			return nil
+		}
+
+		readLease, err := UnmarshalReadLease((m.Entries[0].Data))
+		if err != nil {
+			r.logger.Warningf("%x failed to unmarshal read lease from %x: %v", r.id, m.From, err)
+			return nil
+		}
+		if readLease.NodeId != r.id {
+			r.logger.Warningf("%x received read lease for different node %x from %x", r.id, readLease.NodeId, m.From)
+			return nil
+		}
+
+		readLease = r.readOnly.processGrantedLease(*readLease)
+		r.logger.Infof("%x granted read lease from leader %x: %+v", r.id, m.From, readLease)
 	}
 	return nil
 }
