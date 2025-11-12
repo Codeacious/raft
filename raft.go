@@ -260,6 +260,13 @@ type Config struct {
 	// at any given time. This is only used if ReadOnlyOption is ReadOnlyGrantLeases.
 	MaxNumReadLeases int
 
+	// ReadLeaseCatchupMargin is how far behind a node's log can be when asking
+	// for a read lease. The node must still catch up to the log index before
+	// serving reads locally, but this allows a leader to grant a read lease to a
+	// node it expects can catch up shortly.
+	// This is only used if ReadOnlyOption is ReadOnlyGrantLeases.
+	ReadLeaseCatchupMargin int
+
 	// AskForReadLease enables this node to ask for read leases from the leader
 	// when it is a follower. This is only allowed when ReadOnlyOption is
 	// ReadOnlyGrantLeases.
@@ -359,8 +366,11 @@ func (c *Config) validate() error {
 		return errors.New("CheckQuorum must be enabled when ReadOnlyOption is ReadOnlyLeaseBased or ReadOnlyGrantLeases")
 	}
 
-	if c.ReadOnlyOption == ReadOnlyGrantLeases && (c.ReadLeaseDurationMicros == 0 || c.MaxNumReadLeases <= 0) {
-		return errors.New("must set ReadLeaseDurationMicros and MaxNumReadLeases when using ReadOnlyGrantLeases")
+	if c.ReadOnlyOption == ReadOnlyGrantLeases &&
+		(c.ReadLeaseDurationMicros <= _SAFEGUARD_CLOCK_DRIFT_MICROS ||
+			c.MaxNumReadLeases <= 0 ||
+			c.ReadLeaseCatchupMargin < 0) {
+		return errors.New("must set valid ReadLeaseDurationMicros, MaxNumReadLeases, and ReadLeaseCatchupMargin when using ReadOnlyGrantLeases")
 	}
 
 	return nil
@@ -486,7 +496,7 @@ func newRaft(c *Config) *raft {
 		checkQuorum:        c.CheckQuorum,
 		preVote:            c.PreVote,
 		readOnly: newReadOnly(c.ReadOnlyOption, c.ReadLeaseDurationMicros,
-			c.MaxNumReadLeases, c.AskForReadLease),
+			c.MaxNumReadLeases, c.AskForReadLease, c.ReadLeaseCatchupMargin),
 		disableProposalForwarding:   c.DisableProposalForwarding,
 		disableConfChangeValidation: c.DisableConfChangeValidation,
 		stepDownOnRemoval:           c.StepDownOnRemoval,
@@ -844,7 +854,7 @@ func (r *raft) reset(term uint64) {
 	r.pendingConfIndex = 0
 	r.uncommittedSize = 0
 	r.readOnly = newReadOnly(r.readOnly.option, r.readOnly.readLeaseDuration,
-		r.readOnly.maxReadLeases, r.readOnly.shouldAskForLease)
+		r.readOnly.maxReadLeases, r.readOnly.shouldAskForLease, r.readOnly.leaseCatchupMargin)
 }
 
 func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
@@ -1332,6 +1342,10 @@ func stepLeader(r *raft, m pb.Message) error {
 			r.logger.Debugf("%x [term %d] transfer leadership to %x is in progress; dropping proposal", r.id, r.Term, r.leadTransferee)
 			return ErrProposalDropped
 		}
+		if r.readOnly.option == ReadOnlyGrantLeases && !r.readOnly.safeguardHasPassed() {
+			r.logger.Debugf("%x [term %d] read-only lease safeguard has not passed; dropping proposal", r.id, r.Term)
+			return ErrProposalDropped
+		}
 
 		for i := range m.Entries {
 			e := &m.Entries[i]
@@ -1696,22 +1710,16 @@ func stepLeader(r *raft, m pb.Message) error {
 		}
 	case pb.MsgAskReadLease:
 		r.logger.Infof("Got MsgAskReadLease from %x at leader", m.From)
-		// leaseReq, err := UnmarshalReadLease(m.Entries[0].Data)
-		// if err != nil {
-		// 	r.logger.Warningf("failed to unmarshal read lease request from %x: %v", m.From, err)
-		// 	return nil
-		// }
-
-		// First, check if we have an active read list for this node.
-		// TODO: Do that, checking against readLeaseInfo in r.readOnly.
-
+		// First, check if we have an active read lease for this node.
 		resp := pb.Message{To: m.From, From: r.id, Type: pb.MsgAskReadLeaseResp,
 			Term: r.Term, Index: r.raftLog.committed,
-			Entries: []pb.Entry{{}}} // TODO: Fill entry with read lease info.
+			Entries: []pb.Entry{{}}}
 		// There are three requirements to grant a read lease:
-		if r.Term == m.Term && // 1. The request is for the current term.
-			r.raftLog.committed <= m.Index && // 2. The follower has an up-to-date log. TODO: Allow a marginal gap
-			r.readOnly.getNumReadLeases() < r.readOnly.maxReadLeases { // 3. We have read leases available.
+		if r.readOnly.option == ReadOnlyGrantLeases && // TODO: Maybe log if this specific condition fails?
+			r.Term == m.Term && // 1. The request is for the current term.
+			r.raftLog.committed <= m.Index+uint64(r.readOnly.leaseCatchupMargin) && // 2. The follower has an up-to-date log. TODO: Allow a marginal gap
+			(r.readOnly.getNumReadLeases() < r.readOnly.maxReadLeases || // 3. We have read leases available,
+				r.readOnly.hasActiveReadLease(m.From)) { // OR we already have an active lease for this node.
 			readLease := r.readOnly.grantNewLease(m.From, r.raftLog.committed)
 			resp.Reject = false
 			resp.Entries[0].Data = readLease.Marshal()
@@ -1822,20 +1830,20 @@ func stepFollower(r *raft, m pb.Message) error {
 			return nil
 		}
 		if r.readOnly.option == ReadOnlyGrantLeases {
-			if r.readOnly.hasActiveReadLease(r.id) {
-				resp := r.responseToReadIndexReq(m, r.raftLog.committed) // TODO: Maybe not r.raftLog.committed
+			if r.readOnly.hasActiveReadLease(r.id) &&
+				r.readOnly.getReadLease(r.id).LogIndex <= r.raftLog.committed { // This allows catchup margins
+				resp := r.responseToReadIndexReq(m, r.raftLog.committed) // TODO: Maybe not r.raftLog.committed, but seems correct
 				resp.From = r.id
 				r.send(resp)
 			} else {
-				// leaseReq := ReadLease{NodeId: r.id, Duration: ReadLeaseWallTimeInMicros, LogIndex: r.raftLog.committed}
-				// leaseCtx := leaseReq.Marshal()
-				// TODO: Send this with a request ctx and timeout instead of on every read
-				if r.readOnly.shouldAskForLease {
+				// TODO: A request ctx may be better than canAskForLease(), which uses a static interval
+				if r.readOnly.canAskForLease() {
 					lreq := pb.Message{From: r.id, To: r.lead, Term: r.Term, Index: r.raftLog.committed, Type: pb.MsgAskReadLease}
 					r.send(lreq)
 					r.logger.Infof("%x sending MsgAskReadLease to leader %x", r.id, r.lead)
+					r.readOnly.markAskedForLease()
 				}
-				// Still forward to the leader since we have no lease
+				// Still forward to the leader since we have no lease yet
 				m.To = r.lead
 				r.send(m)
 			}
@@ -2076,6 +2084,15 @@ func (r *raft) applyConfChange(cc pb.ConfChangeV2) pb.ConfState {
 // The inputs usually result from restoring a ConfState or applying a ConfChange.
 func (r *raft) switchToConfig(cfg tracker.Config, trk tracker.ProgressMap) pb.ConfState {
 	traceConfChangeEvent(cfg, r)
+
+	if r.readOnly.option == ReadOnlyGrantLeases {
+		// Remove read leases for nodes that are no longer part of the cluster.
+		for id := range r.trk.Progress {
+			if _, ok := trk[id]; !ok {
+				r.readOnly.removeReadLease(id)
+			}
+		}
+	}
 
 	r.trk.Config = cfg
 	r.trk.Progress = trk

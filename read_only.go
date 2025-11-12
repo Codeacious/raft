@@ -71,34 +71,74 @@ type readIndexStatus struct {
 }
 
 type readOnly struct {
-	option            ReadOnlyOption
-	pendingReadIndex  map[string]*readIndexStatus
-	readIndexQueue    []string
-	readLeaseInfo     []ReadLease
-	readLeaseDuration uint64
-	maxReadLeases     int
-	shouldAskForLease bool
+	option             ReadOnlyOption
+	pendingReadIndex   map[string]*readIndexStatus
+	readIndexQueue     []string
+	readLeaseInfo      map[uint64]*ReadLease
+	readLeaseDuration  uint64
+	maxReadLeases      int
+	shouldAskForLease  bool
+	lastLeaseAskedTime uint64
+	creationTime       uint64
+	safeguardPassed    bool
+	soonestExpiryTime  uint64
+	leaseCatchupMargin int
 }
 
+const _SAFEGUARD_CLOCK_DRIFT_MICROS = 1000 // 1ms clock drift allowed
+const _LEASE_ASK_INTERVAL_MICROS = 10000   // 10ms between lease asks
+
 func newReadOnly(option ReadOnlyOption, duration uint64,
-	maxleases int, askforlease bool) *readOnly {
+	maxleases int, askforlease bool, catchupmargin int) *readOnly {
 	return &readOnly{
-		option:            option,
-		pendingReadIndex:  make(map[string]*readIndexStatus),
-		readLeaseDuration: duration,
-		maxReadLeases:     maxleases,
-		shouldAskForLease: askforlease,
+		option:             option,
+		pendingReadIndex:   make(map[string]*readIndexStatus),
+		readLeaseInfo:      make(map[uint64]*ReadLease),
+		readLeaseDuration:  duration,
+		maxReadLeases:      maxleases,
+		shouldAskForLease:  askforlease,
+		lastLeaseAskedTime: 0,
+		creationTime:       uint64(time.Now().UnixMicro()),
+		safeguardPassed:    false,
+		soonestExpiryTime:  0,
+		leaseCatchupMargin: catchupmargin,
 	}
 }
 
-// TODO: This can be optimized by tracking the soonest expiry time.
+func (ro *readOnly) safeguardHasPassed() bool {
+	if !ro.safeguardPassed {
+		now := uint64(time.Now().UnixMicro())
+		if now-ro.creationTime > ro.readLeaseDuration+_SAFEGUARD_CLOCK_DRIFT_MICROS {
+			ro.safeguardPassed = true
+		}
+	}
+	return ro.safeguardPassed
+}
+
+func (ro *readOnly) canAskForLease() bool {
+	if !ro.shouldAskForLease {
+		return false
+	}
+
+	now := uint64(time.Now().UnixMicro())
+	return now-ro.lastLeaseAskedTime > _LEASE_ASK_INTERVAL_MICROS
+}
+
+func (ro *readOnly) markAskedForLease() {
+	ro.lastLeaseAskedTime = uint64(time.Now().UnixMicro())
+}
+
 func (ro *readOnly) cleanupExpiredLeases() {
 	currentTime := uint64(time.Now().UnixMicro())
-	for i := len(ro.readLeaseInfo) - 1; i >= 0; i-- {
-		lease := ro.readLeaseInfo[i]
+	if currentTime < ro.soonestExpiryTime {
+		return
+	}
+	ro.soonestExpiryTime = 0
+	for id, lease := range ro.readLeaseInfo {
 		if lease.StartTime+lease.Duration <= currentTime {
-			ro.readLeaseInfo[i] = ro.readLeaseInfo[len(ro.readLeaseInfo)-1]
-			ro.readLeaseInfo = ro.readLeaseInfo[:len(ro.readLeaseInfo)-1]
+			delete(ro.readLeaseInfo, id)
+		} else {
+			ro.updateSoonestExpiryTime(lease.StartTime + lease.Duration)
 		}
 	}
 }
@@ -109,12 +149,12 @@ func (ro *readOnly) getNumReadLeases() int {
 }
 
 func (ro *readOnly) getReadLease(id uint64) *ReadLease {
-	for i := range ro.readLeaseInfo {
-		if ro.readLeaseInfo[i].NodeId == id {
-			return &ro.readLeaseInfo[i]
-		}
+	lease, ok := ro.readLeaseInfo[id]
+	if ok {
+		return lease
+	} else {
+		return nil
 	}
-	return nil
 }
 
 func (ro *readOnly) hasActiveReadLease(id uint64) bool {
@@ -131,12 +171,20 @@ func (ro *readOnly) hasActiveReadLease(id uint64) bool {
 	}
 }
 
+func (ro *readOnly) updateSoonestExpiryTime(expTime uint64) {
+	if ro.soonestExpiryTime == 0 || expTime < ro.soonestExpiryTime {
+		ro.soonestExpiryTime = expTime
+	}
+}
+
 func (ro *readOnly) grantNewLease(id uint64, index uint64) *ReadLease {
 	// Try and update an old lease first.
 	var oldLease *ReadLease = ro.getReadLease(id)
 	if oldLease != nil {
 		oldLease.LogIndex = index
 		oldLease.StartTime = uint64(time.Now().UnixMicro())
+		oldLease.Duration = ro.readLeaseDuration
+		ro.updateSoonestExpiryTime(oldLease.StartTime + oldLease.Duration)
 		return oldLease
 	}
 
@@ -146,7 +194,8 @@ func (ro *readOnly) grantNewLease(id uint64, index uint64) *ReadLease {
 		LogIndex:  index,
 		StartTime: uint64(time.Now().UnixMicro()),
 		Duration:  ro.readLeaseDuration}
-	ro.readLeaseInfo = append(ro.readLeaseInfo, newLease)
+	ro.readLeaseInfo[id] = &newLease
+	ro.updateSoonestExpiryTime(newLease.StartTime + newLease.Duration)
 	return ro.getReadLease(id)
 }
 
@@ -158,16 +207,32 @@ func (ro *readOnly) processGrantedLease(lease ReadLease) *ReadLease {
 	}
 
 	// Try and update an old lease first.
+	// We subtract a small safeguard time to account for clock drift.
+	// This function is run by followers/learners, which means their
+	// leases will conservatively expire earlier to account for drift.
 	var oldLease *ReadLease = ro.getReadLease(lease.NodeId)
 	if oldLease != nil {
 		oldLease.LogIndex = lease.LogIndex
 		oldLease.StartTime = lease.StartTime
+		oldLease.Duration = lease.Duration - _SAFEGUARD_CLOCK_DRIFT_MICROS
+		ro.updateSoonestExpiryTime(oldLease.StartTime + oldLease.Duration)
 		return oldLease
 	}
 
 	// Otherwise, make a new lease entry.
-	ro.readLeaseInfo = append(ro.readLeaseInfo, lease)
+	ro.readLeaseInfo[lease.NodeId] = &ReadLease{
+		NodeId:    lease.NodeId,
+		LogIndex:  lease.LogIndex,
+		StartTime: lease.StartTime,
+		Duration:  lease.Duration - _SAFEGUARD_CLOCK_DRIFT_MICROS,
+	}
+	ro.updateSoonestExpiryTime(lease.StartTime + lease.Duration)
 	return ro.getReadLease(lease.NodeId)
+}
+
+func (ro *readOnly) removeReadLease(id uint64) {
+	delete(ro.readLeaseInfo, id)
+	ro.soonestExpiryTime = 0
 }
 
 // addRequest adds a read only request into readonly struct.
