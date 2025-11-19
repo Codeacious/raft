@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"go.etcd.io/raft/v3/confchange"
 	"go.etcd.io/raft/v3/quorum"
@@ -816,6 +817,35 @@ func (r *raft) appliedSnap(snap *pb.Snapshot) {
 	r.appliedTo(index, 0 /* size */)
 }
 
+func (r *raft) askReadLeaseHoldersForAckIndex(cutoffIndex uint64) {
+	if r.readOnly.option != ReadOnlyGrantLeases {
+		r.logger.Warning("askReadLeaseHoldersForAckIndex called when not using ReadOnlyGrantLeases")
+		return
+	}
+	toAsk := r.readOnly.getNodesWithAckIndexLessThan(cutoffIndex)
+	if len(toAsk) == 0 {
+		return
+	}
+	now := uint64(time.Now().UnixMicro())
+	for _, nodeID := range toAsk {
+		rl := r.readOnly.getReadLease(nodeID)
+		if rl == nil {
+			r.logger.Warningf("cannot ask node %x for read lease ack index; no read lease found", nodeID)
+			continue
+		}
+		// Only ask if we haven't asked recently.
+		if rl.LastAckAsked < now && now-rl.LastAckAsked >= _ACK_INDEX_ASK_INTERVAL_MICROS {
+			r.send(pb.Message{
+				To:   nodeID,
+				From: r.id,
+				Term: r.Term,
+				Type: pb.MsgAskAckIndex,
+			})
+			r.readOnly.markAckAskedForAtTime(nodeID, now)
+		}
+	}
+}
+
 // maybeCommit attempts to advance the commit index. Returns true if the commit
 // index changed (in which case the caller should call r.bcastAppend). This can
 // only be called in StateLeader.
@@ -829,11 +859,13 @@ func (r *raft) maybeCommit() bool {
 		readLeaseAckIndex := r.readOnly.getMinReadLeaseAckedIndex()
 		if readLeaseAckIndex == 0 {
 			r.logger.Warningf("cannot advance commit index to %d, min read lease acked index is 0", quorumCommitIndex)
+			r.askReadLeaseHoldersForAckIndex(1)
 			return false
 		}
 		if readLeaseAckIndex < quorumCommitIndex {
 			r.logger.Debugf("cannot advance commit index to %d since it exceeds the min read lease index %d",
 				quorumCommitIndex, readLeaseAckIndex)
+			r.askReadLeaseHoldersForAckIndex(quorumCommitIndex)
 			return r.raftLog.maybeCommit(entryID{term: r.Term, index: readLeaseAckIndex})
 		}
 	}
@@ -1752,6 +1784,25 @@ func stepLeader(r *raft, m pb.Message) error {
 			resp.Reject = true
 		}
 		r.send(resp)
+	case pb.MsgAskAckIndexResp:
+		if r.readOnly.option != ReadOnlyGrantLeases {
+			r.logger.Warningf("got MsgAskAckIndexResp from %x at leader, but leader not using ReadOnlyGrantLeases",
+				m.From)
+			return nil
+		}
+		r.logger.Infof("got MsgAskAckIndexResp from %x at leader for index %d", m.From, m.Index)
+		rl := r.readOnly.getReadLease(m.From)
+		if rl == nil {
+			r.logger.Warningf("no read lease found for %x at leader, but got MsgAskAckIndexResp", m.From)
+			return nil
+		}
+		oldIndex := rl.AckedIndex
+		minAckIndex := r.readOnly.getMinReadLeaseAckedIndex()
+		r.readOnly.markReadLeaseIndex(m.From, m.Index)
+		if oldIndex == minAckIndex && r.maybeCommit() {
+			releasePendingReadIndexMessages(r)
+			r.bcastAppend()
+		}
 	}
 	return nil
 }
@@ -1906,6 +1957,19 @@ func stepFollower(r *raft, m pb.Message) error {
 
 		readLease = r.readOnly.processGrantedLease(*readLease)
 		r.logger.Infof("%x granted read lease from leader %x: %+v", r.id, m.From, readLease)
+	case pb.MsgAskAckIndex:
+		if r.readOnly.option != ReadOnlyGrantLeases {
+			r.logger.Warningf("%x received unexpected MsgAskAckIndex from %x", r.id, m.From, r.readOnly.option)
+			return nil
+		}
+		resp := pb.Message{To: m.From, From: r.id, Type: pb.MsgAskAckIndexResp,
+			Term: r.Term, Index: 0}
+		if r.readOnly.hasActiveReadLease(r.id) {
+			r.readOnly.markReadLeaseIndex(r.id, r.raftLog.lastIndex()) // Maybe unnecessary, but safe
+			resp.Index = r.readOnly.getReadLease(r.id).AckedIndex
+		}
+		r.send(resp)
+		r.logger.Infof("%x sending MsgAskAckIndexResp to %x for ack index %d", r.id, m.From, resp.Index)
 	}
 	return nil
 }

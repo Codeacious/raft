@@ -68,6 +68,8 @@ enum MessageType {
 	// raft/util_test.go.
 	MsgAskReadLease      = 24;
 	MsgAskReadLeaseResp  = 25;
+	MsgAskAckIndex	     = 26;
+	MsgAskAckIndexResp   = 27;
 }
 
 message Message {

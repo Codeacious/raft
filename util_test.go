@@ -135,6 +135,7 @@ func TestIsResponseMsg(t *testing.T) {
 		{pb.MsgStorageApply, false},
 		{pb.MsgStorageApplyResp, true},
 		{pb.MsgAskReadLeaseResp, true},
+		{pb.MsgAskAckIndexResp, true},
 	}
 
 	for i, tt := range tests {

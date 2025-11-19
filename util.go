@@ -48,6 +48,7 @@ var isResponseMsg = [...]bool{
 	pb.MsgStorageAppendResp: true,
 	pb.MsgStorageApplyResp:  true,
 	pb.MsgAskReadLeaseResp:  true,
+	pb.MsgAskAckIndexResp:   true,
 }
 
 func isMsgInArray(msgt pb.MessageType, arr []bool) bool {

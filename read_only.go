@@ -23,6 +23,10 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
+const _SAFEGUARD_CLOCK_DRIFT_MICROS = 1000  // 1ms clock drift allowed
+const _LEASE_ASK_INTERVAL_MICROS = 10000    // 10ms between lease asks
+const _ACK_INDEX_ASK_INTERVAL_MICROS = 5000 // 5ms between ack index asks
+
 // ReadState provides state for read only query.
 // It's caller's responsibility to call ReadIndex first before getting
 // this state from ready, it's also caller's duty to differentiate if this
@@ -34,11 +38,12 @@ type ReadState struct {
 }
 
 type ReadLease struct {
-	NodeId     uint64
-	LogIndex   uint64
-	StartTime  uint64
-	Duration   uint64
-	AckedIndex uint64
+	NodeId       uint64
+	LogIndex     uint64
+	StartTime    uint64
+	Duration     uint64
+	AckedIndex   uint64
+	LastAckAsked uint64
 }
 
 type heapItem struct {
@@ -210,11 +215,12 @@ func UnmarshalReadLease(data []byte) (*ReadLease, error) {
 		return nil, fmt.Errorf("invalid ReadLease data length: got %d, want 40", len(data))
 	}
 	return &ReadLease{
-		NodeId:     binary.BigEndian.Uint64(data[0:8]),
-		LogIndex:   binary.BigEndian.Uint64(data[8:16]),
-		StartTime:  binary.BigEndian.Uint64(data[16:24]),
-		Duration:   binary.BigEndian.Uint64(data[24:32]),
-		AckedIndex: binary.BigEndian.Uint64(data[32:40]),
+		NodeId:       binary.BigEndian.Uint64(data[0:8]),
+		LogIndex:     binary.BigEndian.Uint64(data[8:16]),
+		StartTime:    binary.BigEndian.Uint64(data[16:24]),
+		Duration:     binary.BigEndian.Uint64(data[24:32]),
+		AckedIndex:   binary.BigEndian.Uint64(data[32:40]),
+		LastAckAsked: 0,
 	}, nil
 }
 
@@ -241,9 +247,6 @@ type readOnly struct {
 	safeguardPassed    bool
 	leaseCatchupMargin int
 }
-
-const _SAFEGUARD_CLOCK_DRIFT_MICROS = 1000 // 1ms clock drift allowed
-const _LEASE_ASK_INTERVAL_MICROS = 10000   // 10ms between lease asks
 
 func newReadOnly(option ReadOnlyOption, duration uint64,
 	maxleases int, askforlease bool, catchupmargin int) *readOnly {
@@ -331,11 +334,12 @@ func (ro *readOnly) grantNewLease(id uint64, ackedIndex uint64, logIndex uint64)
 
 	// Otherwise, make a new lease entry.
 	newLease := ReadLease{
-		NodeId:     id,
-		LogIndex:   logIndex,
-		StartTime:  uint64(time.Now().UnixMicro()),
-		Duration:   ro.readLeaseDuration,
-		AckedIndex: ackedIndex}
+		NodeId:       id,
+		LogIndex:     logIndex,
+		StartTime:    uint64(time.Now().UnixMicro()),
+		Duration:     ro.readLeaseDuration,
+		AckedIndex:   ackedIndex,
+		LastAckAsked: 0}
 	ro.readLeases.Put(id, &newLease)
 	return ro.getReadLease(id)
 }
@@ -354,11 +358,12 @@ func (ro *readOnly) processGrantedLease(lease ReadLease) *ReadLease {
 	// This function is run by followers/learners, which means their
 	// leases will conservatively expire earlier to account for drift.
 	ro.readLeases.Put(lease.NodeId, &ReadLease{
-		NodeId:     lease.NodeId,
-		LogIndex:   lease.LogIndex,
-		StartTime:  lease.StartTime,
-		Duration:   lease.Duration - _SAFEGUARD_CLOCK_DRIFT_MICROS,
-		AckedIndex: lease.AckedIndex,
+		NodeId:       lease.NodeId,
+		LogIndex:     lease.LogIndex,
+		StartTime:    lease.StartTime,
+		Duration:     lease.Duration - _SAFEGUARD_CLOCK_DRIFT_MICROS,
+		AckedIndex:   lease.AckedIndex,
+		LastAckAsked: 0,
 	})
 	return ro.getReadLease(lease.NodeId)
 }
@@ -383,6 +388,31 @@ func (ro *readOnly) getMinReadLeaseAckedIndex() uint64 {
 	}
 	ro.readLeases.CleanupExpiredLeases()
 	return ro.readLeases.MinAckedIndex()
+}
+
+func (ro *readOnly) markAckAskedForAtTime(id uint64, markTime uint64) {
+	if ro.option != ReadOnlyGrantLeases {
+		return
+	}
+	lease := ro.getReadLease(id)
+	if lease != nil {
+		lease.LastAckAsked = markTime
+	}
+}
+
+func (ro *readOnly) getNodesWithAckIndexLessThan(cutoff uint64) []uint64 {
+	result := make([]uint64, 0)
+	if ro.option != ReadOnlyGrantLeases {
+		return result
+	}
+	ro.readLeases.CleanupExpiredLeases()
+	ro.readLeases.Range(func(id uint64, lease *ReadLease) bool {
+		if lease.AckedIndex < cutoff {
+			result = append(result, id)
+		}
+		return true
+	})
+	return result
 }
 
 // addRequest adds a read only request into readonly struct.
