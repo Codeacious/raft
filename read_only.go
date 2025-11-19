@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"container/heap"
 	"encoding/binary"
 	"fmt"
 	"time"
@@ -33,30 +34,187 @@ type ReadState struct {
 }
 
 type ReadLease struct {
-	NodeId    uint64
-	LogIndex  uint64
-	StartTime uint64
-	Duration  uint64
+	NodeId     uint64
+	LogIndex   uint64
+	StartTime  uint64
+	Duration   uint64
+	AckedIndex uint64
+}
+
+type heapItem struct {
+	nodeId     uint64
+	ackedIndex uint64
+}
+
+// readLeaseHeap implements heap.Interface for tracking minimum acked indices.
+type readLeaseHeap struct {
+	items   []*heapItem
+	itemMap map[uint64]int // nodeId -> index in heap
+}
+
+type ReadLeaseMap struct {
+	leases            map[uint64]*ReadLease
+	heap              *readLeaseHeap
+	soonestExpiryTime uint64
+}
+
+func (h *readLeaseHeap) Len() int { return len(h.items) }
+
+func (h *readLeaseHeap) Less(i, j int) bool {
+	return h.items[i].ackedIndex < h.items[j].ackedIndex
+}
+
+func (h *readLeaseHeap) Swap(i, j int) {
+	h.items[i], h.items[j] = h.items[j], h.items[i]
+	h.itemMap[h.items[i].nodeId] = i
+	h.itemMap[h.items[j].nodeId] = j
+}
+
+func (h *readLeaseHeap) Push(x any) {
+	item := x.(*heapItem)
+	h.itemMap[item.nodeId] = len(h.items)
+	h.items = append(h.items, item)
+}
+
+func (h *readLeaseHeap) Pop() any {
+	old := h.items
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil
+	h.items = old[0 : n-1]
+	delete(h.itemMap, item.nodeId)
+	return item
+}
+
+func (h *readLeaseHeap) update(nodeId uint64, ackedIndex uint64) {
+	if idx, ok := h.itemMap[nodeId]; ok {
+		// Update existing item
+		h.items[idx].ackedIndex = ackedIndex
+		heap.Fix(h, idx)
+	} else {
+		// Add new item
+		item := &heapItem{
+			nodeId:     nodeId,
+			ackedIndex: ackedIndex,
+		}
+		heap.Push(h, item)
+	}
+}
+
+func (h *readLeaseHeap) remove(nodeId uint64) {
+	if idx, ok := h.itemMap[nodeId]; ok {
+		heap.Remove(h, idx)
+	}
+}
+
+func newReadLeaseMap() *ReadLeaseMap {
+	h := &readLeaseHeap{
+		items:   make([]*heapItem, 0),
+		itemMap: make(map[uint64]int),
+	}
+	heap.Init(h)
+	return &ReadLeaseMap{
+		leases:            make(map[uint64]*ReadLease),
+		heap:              h,
+		soonestExpiryTime: 0,
+	}
+}
+
+func (rlm *ReadLeaseMap) Put(id uint64, lease *ReadLease) {
+	rlm.leases[id] = lease
+	rlm.heap.update(id, lease.AckedIndex)
+	rlm.UpdateSoonestExpiryTime(lease.StartTime + lease.Duration)
+}
+
+func (rlm *ReadLeaseMap) Get(id uint64) (*ReadLease, bool) {
+	lease, ok := rlm.leases[id]
+	return lease, ok
+}
+
+func (rlm *ReadLeaseMap) Delete(id uint64) {
+	delete(rlm.leases, id)
+	rlm.heap.remove(id)
+}
+
+func (rlm *ReadLeaseMap) UpdateAckedIndex(id uint64, index uint64) {
+	if lease, ok := rlm.leases[id]; ok {
+		if index > lease.AckedIndex {
+			lease.AckedIndex = index
+			rlm.heap.update(id, index)
+		}
+	}
+}
+
+func (rlm *ReadLeaseMap) MinAckedIndex() uint64 {
+	if rlm.heap.Len() == 0 {
+		return 0
+	}
+	return rlm.heap.items[0].ackedIndex
+}
+
+func (rlm *ReadLeaseMap) Len() int {
+	return len(rlm.leases)
+}
+
+func (rlm *ReadLeaseMap) Range(f func(id uint64, lease *ReadLease) bool) {
+	for id, lease := range rlm.leases {
+		if !f(id, lease) {
+			break
+		}
+	}
+}
+
+func (rlm *ReadLeaseMap) GetSoonestExpiryTime() uint64 {
+	return rlm.soonestExpiryTime
+}
+
+func (rlm *ReadLeaseMap) UpdateSoonestExpiryTime(expTime uint64) {
+	if rlm.soonestExpiryTime == 0 || expTime < rlm.soonestExpiryTime {
+		rlm.soonestExpiryTime = expTime
+	}
+}
+
+func (rlm *ReadLeaseMap) CleanupExpiredLeases() {
+	currentTime := uint64(time.Now().UnixMicro())
+	if currentTime < rlm.soonestExpiryTime {
+		return
+	}
+
+	rlm.soonestExpiryTime = 0
+
+	for id, lease := range rlm.leases {
+		if lease.StartTime+lease.Duration <= currentTime {
+			rlm.Delete(id)
+		} else {
+			rlm.UpdateSoonestExpiryTime(lease.StartTime + lease.Duration)
+		}
+	}
+}
+
+func (rlm *ReadLeaseMap) ResetSoonestExpiryTime() {
+	rlm.soonestExpiryTime = 0
 }
 
 func (rl *ReadLease) Marshal() []byte {
-	buf := make([]byte, 32)
+	buf := make([]byte, 40)
 	binary.BigEndian.PutUint64(buf[0:8], rl.NodeId)
 	binary.BigEndian.PutUint64(buf[8:16], rl.LogIndex)
 	binary.BigEndian.PutUint64(buf[16:24], rl.StartTime)
 	binary.BigEndian.PutUint64(buf[24:32], rl.Duration)
+	binary.BigEndian.PutUint64(buf[32:40], rl.AckedIndex)
 	return buf
 }
 
 func UnmarshalReadLease(data []byte) (*ReadLease, error) {
-	if len(data) != 32 {
-		return nil, fmt.Errorf("invalid ReadLease data length: got %d, want 32", len(data))
+	if len(data) != 40 {
+		return nil, fmt.Errorf("invalid ReadLease data length: got %d, want 40", len(data))
 	}
 	return &ReadLease{
-		NodeId:    binary.BigEndian.Uint64(data[0:8]),
-		LogIndex:  binary.BigEndian.Uint64(data[8:16]),
-		StartTime: binary.BigEndian.Uint64(data[16:24]),
-		Duration:  binary.BigEndian.Uint64(data[24:32]),
+		NodeId:     binary.BigEndian.Uint64(data[0:8]),
+		LogIndex:   binary.BigEndian.Uint64(data[8:16]),
+		StartTime:  binary.BigEndian.Uint64(data[16:24]),
+		Duration:   binary.BigEndian.Uint64(data[24:32]),
+		AckedIndex: binary.BigEndian.Uint64(data[32:40]),
 	}, nil
 }
 
@@ -74,14 +232,13 @@ type readOnly struct {
 	option             ReadOnlyOption
 	pendingReadIndex   map[string]*readIndexStatus
 	readIndexQueue     []string
-	readLeaseInfo      map[uint64]*ReadLease
+	readLeases         *ReadLeaseMap
 	readLeaseDuration  uint64
 	maxReadLeases      int
 	shouldAskForLease  bool
 	lastLeaseAskedTime uint64
 	creationTime       uint64
 	safeguardPassed    bool
-	soonestExpiryTime  uint64
 	leaseCatchupMargin int
 }
 
@@ -93,19 +250,21 @@ func newReadOnly(option ReadOnlyOption, duration uint64,
 	return &readOnly{
 		option:             option,
 		pendingReadIndex:   make(map[string]*readIndexStatus),
-		readLeaseInfo:      make(map[uint64]*ReadLease),
+		readLeases:         newReadLeaseMap(),
 		readLeaseDuration:  duration,
 		maxReadLeases:      maxleases,
 		shouldAskForLease:  askforlease,
 		lastLeaseAskedTime: 0,
 		creationTime:       uint64(time.Now().UnixMicro()),
 		safeguardPassed:    false,
-		soonestExpiryTime:  0,
 		leaseCatchupMargin: catchupmargin,
 	}
 }
 
 func (ro *readOnly) safeguardHasPassed() bool {
+	if ro.option != ReadOnlyGrantLeases {
+		return true
+	}
 	if !ro.safeguardPassed {
 		now := uint64(time.Now().UnixMicro())
 		if now-ro.creationTime > ro.readLeaseDuration+_SAFEGUARD_CLOCK_DRIFT_MICROS {
@@ -116,7 +275,7 @@ func (ro *readOnly) safeguardHasPassed() bool {
 }
 
 func (ro *readOnly) canAskForLease() bool {
-	if !ro.shouldAskForLease {
+	if ro.option != ReadOnlyGrantLeases || !ro.shouldAskForLease {
 		return false
 	}
 
@@ -128,28 +287,19 @@ func (ro *readOnly) markAskedForLease() {
 	ro.lastLeaseAskedTime = uint64(time.Now().UnixMicro())
 }
 
-func (ro *readOnly) cleanupExpiredLeases() {
-	currentTime := uint64(time.Now().UnixMicro())
-	if currentTime < ro.soonestExpiryTime {
-		return
-	}
-	ro.soonestExpiryTime = 0
-	for id, lease := range ro.readLeaseInfo {
-		if lease.StartTime+lease.Duration <= currentTime {
-			delete(ro.readLeaseInfo, id)
-		} else {
-			ro.updateSoonestExpiryTime(lease.StartTime + lease.Duration)
-		}
-	}
-}
-
 func (ro *readOnly) getNumReadLeases() int {
-	ro.cleanupExpiredLeases()
-	return len(ro.readLeaseInfo)
+	if ro.option != ReadOnlyGrantLeases {
+		return -1
+	}
+	ro.readLeases.CleanupExpiredLeases()
+	return ro.readLeases.Len()
 }
 
 func (ro *readOnly) getReadLease(id uint64) *ReadLease {
-	lease, ok := ro.readLeaseInfo[id]
+	if ro.option != ReadOnlyGrantLeases {
+		return nil
+	}
+	lease, ok := ro.readLeases.Get(id)
 	if ok {
 		return lease
 	} else {
@@ -158,6 +308,9 @@ func (ro *readOnly) getReadLease(id uint64) *ReadLease {
 }
 
 func (ro *readOnly) hasActiveReadLease(id uint64) bool {
+	if ro.option != ReadOnlyGrantLeases {
+		return false
+	}
 	lease := ro.getReadLease(id)
 	if lease == nil {
 		return false
@@ -166,73 +319,70 @@ func (ro *readOnly) hasActiveReadLease(id uint64) bool {
 	if lease.StartTime+lease.Duration > uint64(time.Now().UnixMicro()) {
 		return true
 	} else {
-		ro.cleanupExpiredLeases()
+		ro.readLeases.CleanupExpiredLeases()
 		return false
 	}
 }
 
-func (ro *readOnly) updateSoonestExpiryTime(expTime uint64) {
-	if ro.soonestExpiryTime == 0 || expTime < ro.soonestExpiryTime {
-		ro.soonestExpiryTime = expTime
-	}
-}
-
-func (ro *readOnly) grantNewLease(id uint64, index uint64) *ReadLease {
-	// Try and update an old lease first.
-	var oldLease *ReadLease = ro.getReadLease(id)
-	if oldLease != nil {
-		oldLease.LogIndex = index
-		oldLease.StartTime = uint64(time.Now().UnixMicro())
-		oldLease.Duration = ro.readLeaseDuration
-		ro.updateSoonestExpiryTime(oldLease.StartTime + oldLease.Duration)
-		return oldLease
+func (ro *readOnly) grantNewLease(id uint64, ackedIndex uint64, logIndex uint64) *ReadLease {
+	if ro.option != ReadOnlyGrantLeases {
+		return nil
 	}
 
 	// Otherwise, make a new lease entry.
 	newLease := ReadLease{
-		NodeId:    id,
-		LogIndex:  index,
-		StartTime: uint64(time.Now().UnixMicro()),
-		Duration:  ro.readLeaseDuration}
-	ro.readLeaseInfo[id] = &newLease
-	ro.updateSoonestExpiryTime(newLease.StartTime + newLease.Duration)
+		NodeId:     id,
+		LogIndex:   logIndex,
+		StartTime:  uint64(time.Now().UnixMicro()),
+		Duration:   ro.readLeaseDuration,
+		AckedIndex: ackedIndex}
+	ro.readLeases.Put(id, &newLease)
 	return ro.getReadLease(id)
 }
 
 func (ro *readOnly) processGrantedLease(lease ReadLease) *ReadLease {
+	if ro.option != ReadOnlyGrantLeases {
+		return nil
+	}
 	if lease.StartTime == 0 || lease.Duration == 0 ||
 		lease.StartTime+lease.Duration <= uint64(time.Now().UnixMicro()) {
 		// Expired lease, do not process.
 		return nil
 	}
 
-	// Try and update an old lease first.
 	// We subtract a small safeguard time to account for clock drift.
 	// This function is run by followers/learners, which means their
 	// leases will conservatively expire earlier to account for drift.
-	var oldLease *ReadLease = ro.getReadLease(lease.NodeId)
-	if oldLease != nil {
-		oldLease.LogIndex = lease.LogIndex
-		oldLease.StartTime = lease.StartTime
-		oldLease.Duration = lease.Duration - _SAFEGUARD_CLOCK_DRIFT_MICROS
-		ro.updateSoonestExpiryTime(oldLease.StartTime + oldLease.Duration)
-		return oldLease
-	}
-
-	// Otherwise, make a new lease entry.
-	ro.readLeaseInfo[lease.NodeId] = &ReadLease{
-		NodeId:    lease.NodeId,
-		LogIndex:  lease.LogIndex,
-		StartTime: lease.StartTime,
-		Duration:  lease.Duration - _SAFEGUARD_CLOCK_DRIFT_MICROS,
-	}
-	ro.updateSoonestExpiryTime(lease.StartTime + lease.Duration)
+	ro.readLeases.Put(lease.NodeId, &ReadLease{
+		NodeId:     lease.NodeId,
+		LogIndex:   lease.LogIndex,
+		StartTime:  lease.StartTime,
+		Duration:   lease.Duration - _SAFEGUARD_CLOCK_DRIFT_MICROS,
+		AckedIndex: lease.AckedIndex,
+	})
 	return ro.getReadLease(lease.NodeId)
 }
 
 func (ro *readOnly) removeReadLease(id uint64) {
-	delete(ro.readLeaseInfo, id)
-	ro.soonestExpiryTime = 0
+	if ro.option != ReadOnlyGrantLeases {
+		return
+	}
+	ro.readLeases.Delete(id)
+}
+
+func (ro *readOnly) markReadLeaseIndex(id uint64, index uint64) {
+	if ro.option != ReadOnlyGrantLeases {
+		return
+	}
+	ro.readLeases.UpdateAckedIndex(id, index)
+}
+
+func (ro *readOnly) getMinReadLeaseAckedIndex() uint64 {
+	if ro.option != ReadOnlyGrantLeases {
+		return 0
+	}
+	ro.readLeases.CleanupExpiredLeases()
+	return ro.readLeases.MinAckedIndex()
 }
 
 // addRequest adds a read only request into readonly struct.

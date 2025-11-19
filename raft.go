@@ -821,8 +821,24 @@ func (r *raft) appliedSnap(snap *pb.Snapshot) {
 // only be called in StateLeader.
 func (r *raft) maybeCommit() bool {
 	defer traceCommit(r)
+	quorumCommitIndex := r.trk.Committed()
 
-	return r.raftLog.maybeCommit(entryID{term: r.Term, index: r.trk.Committed()})
+	if r.readOnly.option == ReadOnlyGrantLeases && r.readOnly.getNumReadLeases() > 0 {
+		// With read leases, we can only commit up to the minimum of the
+		// quorum commit index and the lease index.
+		readLeaseAckIndex := r.readOnly.getMinReadLeaseAckedIndex()
+		if readLeaseAckIndex == 0 {
+			r.logger.Warningf("cannot advance commit index to %d, min read lease acked index is 0", quorumCommitIndex)
+			return false
+		}
+		if readLeaseAckIndex < quorumCommitIndex {
+			r.logger.Debugf("cannot advance commit index to %d since it exceeds the min read lease index %d",
+				quorumCommitIndex, readLeaseAckIndex)
+			return r.raftLog.maybeCommit(entryID{term: r.Term, index: readLeaseAckIndex})
+		}
+	}
+
+	return r.raftLog.maybeCommit(entryID{term: r.Term, index: quorumCommitIndex})
 }
 
 func (r *raft) reset(term uint64) {
@@ -1566,6 +1582,10 @@ func stepLeader(r *raft, m pb.Message) error {
 			// back to replicating state is not useful; besides pr.PendingSnapshot
 			// would prevent it.
 			if pr.MaybeUpdate(m.Index) || (pr.Match == m.Index && pr.State == tracker.StateProbe) {
+				if r.readOnly.option == ReadOnlyGrantLeases {
+					r.readOnly.markReadLeaseIndex(m.From, m.Index)
+				}
+
 				switch {
 				case pr.State == tracker.StateProbe:
 					pr.BecomeReplicate()
@@ -1717,10 +1737,15 @@ func stepLeader(r *raft, m pb.Message) error {
 		// There are three requirements to grant a read lease:
 		if r.readOnly.option == ReadOnlyGrantLeases && // TODO: Maybe log if this specific condition fails?
 			r.Term == m.Term && // 1. The request is for the current term.
-			r.raftLog.committed <= m.Index+uint64(r.readOnly.leaseCatchupMargin) && // 2. The follower has an up-to-date log. TODO: Allow a marginal gap
+			r.raftLog.committed <= m.Index+uint64(r.readOnly.leaseCatchupMargin) && // 2. The follower has an up-to-date log.
 			(r.readOnly.getNumReadLeases() < r.readOnly.maxReadLeases || // 3. We have read leases available,
 				r.readOnly.hasActiveReadLease(m.From)) { // OR we already have an active lease for this node.
-			readLease := r.readOnly.grantNewLease(m.From, r.raftLog.committed)
+			pr := r.trk.Progress[m.From]
+			ackIndex := m.Index
+			if pr != nil {
+				ackIndex = max(m.Index, pr.Match)
+			}
+			readLease := r.readOnly.grantNewLease(m.From, ackIndex, r.raftLog.committed)
 			resp.Reject = false
 			resp.Entries[0].Data = readLease.Marshal()
 		} else {
@@ -1830,9 +1855,11 @@ func stepFollower(r *raft, m pb.Message) error {
 			return nil
 		}
 		if r.readOnly.option == ReadOnlyGrantLeases {
-			if r.readOnly.hasActiveReadLease(r.id) &&
-				r.readOnly.getReadLease(r.id).LogIndex <= r.raftLog.committed { // This allows catchup margins
-				resp := r.responseToReadIndexReq(m, r.raftLog.committed) // TODO: Maybe not r.raftLog.committed, but seems correct
+			rl := r.readOnly.getReadLease(r.id)
+			if rl != nil &&
+				rl.LogIndex <= r.raftLog.committed && // This enforces catchup margins
+				rl.AckedIndex <= r.raftLog.committed { // This enforces that this node has anything it's acked
+				resp := r.responseToReadIndexReq(m, r.raftLog.committed)
 				resp.From = r.id
 				r.send(resp)
 			} else {
@@ -1900,10 +1927,12 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 
 	if a.prev.index < r.raftLog.committed {
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
+		r.readOnly.markReadLeaseIndex(r.id, r.raftLog.committed)
 		return
 	}
 	if mlastIndex, ok := r.raftLog.maybeAppend(a, m.Commit); ok {
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
+		r.readOnly.markReadLeaseIndex(r.id, mlastIndex)
 		return
 	}
 	r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
@@ -1954,10 +1983,12 @@ func (r *raft) handleSnapshot(m pb.Message) {
 		r.logger.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, sindex, sterm)
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex()})
+		r.readOnly.markReadLeaseIndex(r.id, r.raftLog.lastIndex())
 	} else {
 		r.logger.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, sindex, sterm)
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
+		r.readOnly.markReadLeaseIndex(r.id, r.raftLog.committed)
 	}
 }
 
