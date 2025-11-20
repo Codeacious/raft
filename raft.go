@@ -1907,23 +1907,26 @@ func stepFollower(r *raft, m pb.Message) error {
 		}
 		if r.readOnly.option == ReadOnlyGrantLeases {
 			rl := r.readOnly.getReadLease(r.id)
+			untilExpired := r.readOnly.microsUntilLeaseExpired(r.id)
 			if rl != nil &&
+				untilExpired > 0 && // Check that the lease is still valid
 				rl.LogIndex <= r.raftLog.committed && // This enforces catchup margins
 				rl.AckedIndex <= r.raftLog.committed { // This enforces that this node has anything it's acked
 				resp := r.responseToReadIndexReq(m, r.raftLog.committed)
 				resp.From = r.id
 				r.send(resp)
 			} else {
-				// TODO: A request ctx may be better than canAskForLease(), which uses a static interval
-				if r.readOnly.canAskForLease() {
-					lreq := pb.Message{From: r.id, To: r.lead, Term: r.Term, Index: r.raftLog.committed, Type: pb.MsgAskReadLease}
-					r.send(lreq)
-					r.logger.Infof("%x sending MsgAskReadLease to leader %x", r.id, r.lead)
-					r.readOnly.markAskedForLease()
-				}
-				// Still forward to the leader since we have no lease yet
+				// Still forward to the leader since we can't serve the request
 				m.To = r.lead
 				r.send(m)
+			}
+			// TODO: A request ctx may be better than canAskForLease(), which uses a static interval
+			if untilExpired < _LEASE_RENEWAL_THRESHOLD_MICROS && r.readOnly.canAskForLease() {
+				lreq := pb.Message{From: r.id, To: r.lead, Term: r.Term,
+					Index: r.raftLog.committed, Type: pb.MsgAskReadLease}
+				r.send(lreq)
+				r.logger.Infof("%x sending MsgAskReadLease to leader %x", r.id, r.lead)
+				r.readOnly.markAskedForLease()
 			}
 		} else {
 			m.To = r.lead

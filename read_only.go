@@ -23,9 +23,10 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
-const _SAFEGUARD_CLOCK_DRIFT_MICROS = 1000  // 1ms clock drift allowed
-const _LEASE_ASK_INTERVAL_MICROS = 10000    // 10ms between lease asks
-const _ACK_INDEX_ASK_INTERVAL_MICROS = 5000 // 5ms between ack index asks
+const _SAFEGUARD_CLOCK_DRIFT_MICROS = 1000    // 1ms clock drift allowed
+const _LEASE_ASK_INTERVAL_MICROS = 10000      // 10ms between lease asks
+const _ACK_INDEX_ASK_INTERVAL_MICROS = 5000   // 5ms between ack index asks
+const _LEASE_RENEWAL_THRESHOLD_MICROS = 20000 // 20ms before expiry
 
 // ReadState provides state for read only query.
 // It's caller's responsibility to call ReadIndex first before getting
@@ -310,21 +311,26 @@ func (ro *readOnly) getReadLease(id uint64) *ReadLease {
 	}
 }
 
-func (ro *readOnly) hasActiveReadLease(id uint64) bool {
+func (ro *readOnly) microsUntilLeaseExpired(id uint64) uint64 {
 	if ro.option != ReadOnlyGrantLeases {
-		return false
+		return 0
 	}
 	lease := ro.getReadLease(id)
 	if lease == nil {
-		return false
+		return 0
 	}
 
-	if lease.StartTime+lease.Duration > uint64(time.Now().UnixMicro()) {
-		return true
+	now := uint64(time.Now().UnixMicro())
+	if lease.StartTime+lease.Duration > now {
+		return (lease.StartTime + lease.Duration) - now
 	} else {
 		ro.readLeases.CleanupExpiredLeases()
-		return false
+		return 0
 	}
+}
+
+func (ro *readOnly) hasActiveReadLease(id uint64) bool {
+	return ro.microsUntilLeaseExpired(id) > 0
 }
 
 func (ro *readOnly) grantNewLease(id uint64, ackedIndex uint64, logIndex uint64) *ReadLease {
