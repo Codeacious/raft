@@ -1911,7 +1911,12 @@ func stepFollower(r *raft, m pb.Message) error {
 			if rl != nil &&
 				untilExpired > 0 && // Check that the lease is still valid
 				rl.LogIndex <= r.raftLog.committed && // This enforces catchup margins
-				rl.AckedIndex <= r.raftLog.committed { // This enforces that this node has anything it's acked
+				rl.AckedIndex <= r.raftLog.committed && // This enforces that this node has anything it's acked
+				// Experimental feature: if Commit is set, this is a hint that a P4 switch
+				// in front of this node has acked up to Commit. In this case, we cannot
+				// serve the read index request unless raftLog.committed >= Commit.
+				// (the same as the previous condition with rl.AckedIndex.)
+				(m.Commit == 0 || r.raftLog.committed >= m.Commit) {
 				resp := r.responseToReadIndexReq(m, r.raftLog.committed)
 				resp.From = r.id
 				r.send(resp)
