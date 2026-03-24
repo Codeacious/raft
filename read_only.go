@@ -18,15 +18,18 @@ import (
 	"container/heap"
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"time"
 
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
-const _SAFEGUARD_CLOCK_DRIFT_MICROS = 1000    // 1ms clock drift allowed
-const _LEASE_ASK_INTERVAL_MICROS = 10000      // 10ms between lease asks
-const _ACK_INDEX_ASK_INTERVAL_MICROS = 5000   // 5ms between ack index asks
-const _LEASE_RENEWAL_THRESHOLD_MICROS = 20000 // 20ms before expiry
+const _SAFEGUARD_CLOCK_DRIFT_MICROS = 1000         // 1ms clock drift allowed
+const _LEASE_ASK_INTERVAL_MICROS = 10000           // 10ms between lease asks
+const _ACK_INDEX_ASK_INTERVAL_MICROS = 5000        // 5ms between ack index asks
+const _LEASE_RENEWAL_THRESHOLD_MICROS = 30000      // 30ms before expiry
+const _READ_INDEX_LOCAL_HOLD_DURATION_MICROS = 750 // 750us to hold a read index request before sending it to leader
+const _READ_INDEX_LOCAL_HOLD_LOG_THRESHOLD = 100   // Log index threshold for holding a read index request
 
 // ReadState provides state for read only query.
 // It's caller's responsibility to call ReadIndex first before getting
@@ -62,6 +65,11 @@ type ReadLeaseMap struct {
 	leases            map[uint64]*ReadLease
 	heap              *readLeaseHeap
 	soonestExpiryTime uint64
+}
+
+type ReadLeaseStats struct {
+	TimesReadLeaseUsed uint64
+	TimesGotReadQuery  uint64
 }
 
 func (h *readLeaseHeap) Len() int { return len(h.items) }
@@ -240,6 +248,7 @@ type readOnly struct {
 	pendingReadIndex   map[string]*readIndexStatus
 	readIndexQueue     []string
 	readLeases         *ReadLeaseMap
+	readLeaseStats     ReadLeaseStats
 	readLeaseDuration  uint64
 	maxReadLeases      int
 	shouldAskForLease  bool
@@ -255,6 +264,7 @@ func newReadOnly(option ReadOnlyOption, duration uint64,
 		option:             option,
 		pendingReadIndex:   make(map[string]*readIndexStatus),
 		readLeases:         newReadLeaseMap(),
+		readLeaseStats:     ReadLeaseStats{},
 		readLeaseDuration:  duration,
 		maxReadLeases:      maxleases,
 		shouldAskForLease:  askforlease,
@@ -490,4 +500,110 @@ func (ro *readOnly) lastPendingRequestCtx() string {
 		return ""
 	}
 	return ro.readIndexQueue[len(ro.readIndexQueue)-1]
+}
+
+type DelayedMsgReadIndex struct {
+	msg           pb.Message
+	forwardAtTime uint64
+	requiredIndex uint64
+}
+
+type readIndexDelayer struct {
+	delayedReadIndexReqs    []DelayedMsgReadIndex
+	delayedReadsTimer       *time.Timer
+	delayedReadsChannel     chan pb.Message
+	delayedReadsChanDone    chan struct{}
+	delayedReadsHandlerLock sync.Mutex
+}
+
+func newReadIndexDelayer(outC chan pb.Message, outDone chan struct{}) *readIndexDelayer {
+	return &readIndexDelayer{
+		delayedReadIndexReqs:    make([]DelayedMsgReadIndex, 0, 50),
+		delayedReadsTimer:       nil,
+		delayedReadsChannel:     outC,
+		delayedReadsChanDone:    outDone,
+		delayedReadsHandlerLock: sync.Mutex{},
+	}
+}
+
+func (ro *readOnly) markReadIndexStat(usedReadLease bool) {
+	if usedReadLease {
+		ro.readLeaseStats.TimesReadLeaseUsed++
+	}
+	ro.readLeaseStats.TimesGotReadQuery++
+}
+
+func (rd *readIndexDelayer) addDelayedReadIndexReq(msg pb.Message, requiredIndex uint64) {
+	rd.delayedReadIndexReqs = append(rd.delayedReadIndexReqs, DelayedMsgReadIndex{
+		msg:           msg,
+		forwardAtTime: uint64(time.Now().UnixMicro()) + _READ_INDEX_LOCAL_HOLD_DURATION_MICROS,
+		requiredIndex: requiredIndex,
+	})
+	rd.rearmDelayedReadIndexTimer()
+}
+
+func (rd *readIndexDelayer) rearmDelayedReadIndexTimer() {
+	if rd.delayedReadsTimer == nil {
+		rd.delayedReadsTimer = time.AfterFunc(
+			time.Duration(_READ_INDEX_LOCAL_HOLD_DURATION_MICROS)*time.Microsecond,
+			func() {
+				rd.delayedReadsTimer = nil
+				toSend := rd.fireDelayedReadIndexRequests(0)
+				for _, next := range toSend {
+					select {
+					case <-rd.delayedReadsChanDone:
+						return
+					case rd.delayedReadsChannel <- next:
+					}
+				}
+
+			})
+	}
+}
+
+func (rd *readIndexDelayer) fireDelayedReadIndexRequests(commitIndex uint64) []pb.Message {
+	if len(rd.delayedReadIndexReqs) == 0 {
+		return nil
+	}
+	// We need to ensure the main raft loop and the timer don't fire this at the same time.
+	rd.delayedReadsHandlerLock.Lock()
+	defer rd.delayedReadsHandlerLock.Unlock()
+
+	var workingSet []pb.Message
+	now := uint64(time.Now().UnixMicro())
+	for len(rd.delayedReadIndexReqs) > 0 {
+		next := rd.delayedReadIndexReqs[0]
+		if next.requiredIndex <= commitIndex {
+			next.msg.Index = next.requiredIndex
+			if workingSet == nil {
+				workingSet = make([]pb.Message, 0, 1)
+			}
+			workingSet = append(workingSet, next.msg)
+			rd.delayedReadIndexReqs = rd.delayedReadIndexReqs[1:]
+		} else if next.forwardAtTime <= now {
+			next.msg.Index = next.requiredIndex
+			next.msg.Reject = true
+			if workingSet == nil {
+				workingSet = make([]pb.Message, 0, 1)
+			}
+			workingSet = append(workingSet, next.msg)
+			rd.delayedReadIndexReqs = rd.delayedReadIndexReqs[1:]
+		} else {
+			break
+		}
+	}
+	if len(rd.delayedReadIndexReqs) > 0 {
+		rd.rearmDelayedReadIndexTimer()
+	}
+	return workingSet
+}
+
+func (rd *readIndexDelayer) clear() {
+	rd.delayedReadsHandlerLock.Lock()
+	defer rd.delayedReadsHandlerLock.Unlock()
+	if rd.delayedReadsTimer != nil {
+		rd.delayedReadsTimer.Stop()
+		rd.delayedReadsTimer = nil
+	}
+	rd.delayedReadIndexReqs = make([]DelayedMsgReadIndex, 0, 50)
 }

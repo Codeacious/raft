@@ -222,6 +222,11 @@ type Node interface {
 	// Note that request can be lost without notice, therefore it is user's job
 	// to ensure read index retries.
 	ReadIndex(ctx context.Context, rctx []byte) error
+	// Duplicate function for giving a read lease holder the ack index saved on its ToR switch.
+	// Passing 0 will mean switchIndex is ignored.
+	ReadIndexSwitchHint(ctx context.Context, rctx []byte, switchIndex uint64) error
+	// Returns true if this node is configured to ask for read leases.
+	IsAskingForReadLease() bool
 
 	// Status returns the current status of the raft state machine.
 	Status() Status
@@ -347,6 +352,8 @@ func (n *node) run() {
 	var rd Ready
 
 	r := n.rn.raft
+	r.readIndexDelayer.delayedReadsChannel = n.recvc
+	r.readIndexDelayer.delayedReadsChanDone = n.done
 
 	lead := None
 
@@ -607,4 +614,12 @@ func (n *node) ForgetLeader(ctx context.Context) error {
 
 func (n *node) ReadIndex(ctx context.Context, rctx []byte) error {
 	return n.step(ctx, pb.Message{Type: pb.MsgReadIndex, Entries: []pb.Entry{{Data: rctx}}})
+}
+
+func (n *node) ReadIndexSwitchHint(ctx context.Context, rctx []byte, switchIndex uint64) error {
+	return n.step(ctx, pb.Message{Type: pb.MsgReadIndex, Commit: switchIndex, Entries: []pb.Entry{{Data: rctx}}})
+}
+
+func (n *node) IsAskingForReadLease() bool {
+	return n.rn.raft.readOnly.shouldAskForLease
 }

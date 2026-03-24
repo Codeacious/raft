@@ -435,7 +435,8 @@ type raft struct {
 	// term changes.
 	uncommittedSize entryPayloadSize
 
-	readOnly *readOnly
+	readOnly         *readOnly
+	readIndexDelayer *readIndexDelayer
 
 	// number of ticks since it reached last electionTimeout when it is leader
 	// or candidate.
@@ -498,6 +499,7 @@ func newRaft(c *Config) *raft {
 		preVote:            c.PreVote,
 		readOnly: newReadOnly(c.ReadOnlyOption, c.ReadLeaseDurationMicros,
 			c.MaxNumReadLeases, c.AskForReadLease, c.ReadLeaseCatchupMargin),
+		readIndexDelayer:            newReadIndexDelayer(nil, nil),
 		disableProposalForwarding:   c.DisableProposalForwarding,
 		disableConfChangeValidation: c.DisableConfChangeValidation,
 		stepDownOnRemoval:           c.StepDownOnRemoval,
@@ -838,7 +840,6 @@ func (r *raft) askReadLeaseHoldersForAckIndex(cutoffIndex uint64) {
 			r.send(pb.Message{
 				To:   nodeID,
 				From: r.id,
-				Term: r.Term,
 				Type: pb.MsgAskAckIndex,
 			})
 			r.readOnly.markAckAskedForAtTime(nodeID, now)
@@ -903,6 +904,7 @@ func (r *raft) reset(term uint64) {
 	r.uncommittedSize = 0
 	r.readOnly = newReadOnly(r.readOnly.option, r.readOnly.readLeaseDuration,
 		r.readOnly.maxReadLeases, r.readOnly.shouldAskForLease, r.readOnly.leaseCatchupMargin)
+	r.readIndexDelayer.clear()
 }
 
 func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
@@ -1764,8 +1766,7 @@ func stepLeader(r *raft, m pb.Message) error {
 		r.logger.Infof("Got MsgAskReadLease from %x at leader", m.From)
 		// First, check if we have an active read lease for this node.
 		resp := pb.Message{To: m.From, From: r.id, Type: pb.MsgAskReadLeaseResp,
-			Term: r.Term, Index: r.raftLog.committed,
-			Entries: []pb.Entry{{}}}
+			Index: r.raftLog.committed, Entries: []pb.Entry{{}}}
 		// There are three requirements to grant a read lease:
 		if r.readOnly.option == ReadOnlyGrantLeases && // TODO: Maybe log if this specific condition fails?
 			r.Term == m.Term && // 1. The request is for the current term.
@@ -1910,16 +1911,33 @@ func stepFollower(r *raft, m pb.Message) error {
 			untilExpired := r.readOnly.microsUntilLeaseExpired(r.id)
 			if rl != nil &&
 				untilExpired > 0 && // Check that the lease is still valid
-				rl.LogIndex <= r.raftLog.committed && // This enforces catchup margins
-				rl.AckedIndex <= r.raftLog.committed && // This enforces that this node has anything it's acked
-				// Experimental feature: if Commit is set, this is a hint that a P4 switch
-				// in front of this node has acked up to Commit. In this case, we cannot
-				// serve the read index request unless raftLog.committed >= Commit.
-				// (the same as the previous condition with rl.AckedIndex.)
-				(m.Commit == 0 || r.raftLog.committed >= m.Commit) {
-				resp := r.responseToReadIndexReq(m, r.raftLog.committed)
-				resp.From = r.id
-				r.send(resp)
+				rl.LogIndex <= r.raftLog.committed { // This enforces catchup margins
+				if (rl.AckedIndex <= r.raftLog.committed && // This enforces that this node has anything it's acked
+					// Experimental feature: if Commit is set, this is a hint that a P4 switch
+					// in front of this node has acked up to Commit. In this case, we cannot
+					// serve the read index request unless raftLog.committed >= Commit.
+					// (the same as the previous condition with rl.AckedIndex.)
+					(m.Commit == 0 || m.Commit <= r.raftLog.committed)) ||
+					// Used for delayed read index requests- m.Index is set to the original commitVal set below
+					(m.Index != 0 && m.Index <= r.raftLog.committed) {
+					resp := r.responseToReadIndexReq(m, r.raftLog.committed)
+					resp.From = r.id
+					r.send(resp)
+				} else { // In this case, we haven't caught up yet; try to hold onto this for a bit.
+					commitVal := m.Commit
+					if commitVal == ^uint64(0) {
+						commitVal = 0
+					}
+					commitVal = max(commitVal, rl.AckedIndex)
+					if !m.Reject &&
+						(commitVal-r.raftLog.committed) <= _READ_INDEX_LOCAL_HOLD_LOG_THRESHOLD {
+						r.readIndexDelayer.addDelayedReadIndexReq(m, commitVal)
+					} else {
+						m.To = r.lead
+						r.send(m)
+						r.logger.Infof("%x forwarding read index request to leader %x since we haven't caught up yet (lease acked index: %d)", r.id, r.lead, rl.AckedIndex)
+					}
+				}
 			} else {
 				// Still forward to the leader since we can't serve the request
 				m.To = r.lead
@@ -1927,8 +1945,8 @@ func stepFollower(r *raft, m pb.Message) error {
 			}
 			// TODO: A request ctx may be better than canAskForLease(), which uses a static interval
 			if untilExpired < _LEASE_RENEWAL_THRESHOLD_MICROS && r.readOnly.canAskForLease() {
-				lreq := pb.Message{From: r.id, To: r.lead, Term: r.Term,
-					Index: r.raftLog.committed, Type: pb.MsgAskReadLease}
+				lreq := pb.Message{From: r.id, To: r.lead, Index: r.raftLog.committed,
+					Type: pb.MsgAskReadLease}
 				r.send(lreq)
 				r.logger.Infof("%x sending MsgAskReadLease to leader %x", r.id, r.lead)
 				r.readOnly.markAskedForLease()
@@ -1970,8 +1988,7 @@ func stepFollower(r *raft, m pb.Message) error {
 			r.logger.Warningf("%x received unexpected MsgAskAckIndex from %x", r.id, m.From, r.readOnly.option)
 			return nil
 		}
-		resp := pb.Message{To: m.From, From: r.id, Type: pb.MsgAskAckIndexResp,
-			Term: r.Term, Index: 0}
+		resp := pb.Message{To: m.From, From: r.id, Type: pb.MsgAskAckIndexResp, Index: 0}
 		if r.readOnly.hasActiveReadLease(r.id) {
 			r.readOnly.markReadLeaseIndex(r.id, r.raftLog.lastIndex()) // Maybe unnecessary, but safe
 			resp.Index = r.readOnly.getReadLease(r.id).AckedIndex
@@ -2005,6 +2022,10 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 	if mlastIndex, ok := r.raftLog.maybeAppend(a, m.Commit); ok {
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
 		r.readOnly.markReadLeaseIndex(r.id, mlastIndex)
+		toFire := r.readIndexDelayer.fireDelayedReadIndexRequests(r.raftLog.committed)
+		for _, next := range toFire {
+			r.Step(next)
+		}
 		return
 	}
 	r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
@@ -2040,6 +2061,11 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 
 func (r *raft) handleHeartbeat(m pb.Message) {
 	r.raftLog.commitTo(m.Commit)
+	r.readOnly.markReadLeaseIndex(r.id, r.raftLog.committed)
+	toFire := r.readIndexDelayer.fireDelayedReadIndexRequests(r.raftLog.committed)
+	for _, next := range toFire {
+		r.Step(next)
+	}
 	r.send(pb.Message{To: m.From, Type: pb.MsgHeartbeatResp, Context: m.Context})
 }
 
@@ -2056,6 +2082,10 @@ func (r *raft) handleSnapshot(m pb.Message) {
 			r.id, r.raftLog.committed, sindex, sterm)
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex()})
 		r.readOnly.markReadLeaseIndex(r.id, r.raftLog.lastIndex())
+		toFire := r.readIndexDelayer.fireDelayedReadIndexRequests(r.raftLog.committed)
+		for _, next := range toFire {
+			r.Step(next)
+		}
 	} else {
 		r.logger.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, sindex, sterm)

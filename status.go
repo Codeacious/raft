@@ -25,8 +25,9 @@ import (
 // The Progress is only populated on the leader.
 type Status struct {
 	BasicStatus
-	Config   tracker.Config
-	Progress map[uint64]tracker.Progress
+	Config         tracker.Config
+	Progress       map[uint64]tracker.Progress
+	ReadLeaseStats ReadLeaseStats
 }
 
 // BasicStatus contains basic information about the Raft peer. It does not allocate.
@@ -72,6 +73,9 @@ func getStatus(r *raft) Status {
 		s.Progress = getProgressCopy(r)
 	}
 	s.Config = r.trk.Config.Clone()
+	if r.readOnly != nil {
+		s.ReadLeaseStats = r.readOnly.readLeaseStats
+	}
 	return s
 }
 
@@ -92,7 +96,9 @@ func (s Status) MarshalJSON() ([]byte, error) {
 		j = j[:len(j)-1] + "},"
 	}
 
-	j += fmt.Sprintf(`"leadtransferee":"%x"}`, s.LeadTransferee)
+	// j += fmt.Sprintf(`"leadtransferee":"%x"}`, s.LeadTransferee)
+	j += fmt.Sprintf(`"leadtransferee":"%x","readLeaseStats":{"timesReadLeaseUsed":%d,"timesGotReadQuery":%d}}`,
+		s.LeadTransferee, s.ReadLeaseStats.TimesReadLeaseUsed, s.ReadLeaseStats.TimesGotReadQuery)
 	return []byte(j), nil
 }
 
