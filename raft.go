@@ -1763,7 +1763,7 @@ func stepLeader(r *raft, m pb.Message) error {
 			r.sendAppend(leadTransferee)
 		}
 	case pb.MsgAskReadLease:
-		r.logger.Infof("Got MsgAskReadLease from %x at leader", m.From)
+		r.logger.Infof("Got MsgAskReadLease from %x at leader (leaseId: %d)", m.From, m.LogTerm)
 		// First, check if we have an active read lease for this node.
 		resp := pb.Message{To: m.From, From: r.id, Type: pb.MsgAskReadLeaseResp,
 			Index: r.raftLog.committed, Entries: []pb.Entry{{}}}
@@ -1778,7 +1778,7 @@ func stepLeader(r *raft, m pb.Message) error {
 			if pr != nil {
 				ackIndex = max(m.Index, pr.Match)
 			}
-			readLease := r.readOnly.grantNewLease(m.From, ackIndex, r.raftLog.committed)
+			readLease := r.readOnly.grantNewLease(m.From, m.LogTerm, ackIndex, r.raftLog.committed)
 			resp.Reject = false
 			resp.Entries[0].Data = readLease.Marshal()
 		} else {
@@ -1923,6 +1923,8 @@ func stepFollower(r *raft, m pb.Message) error {
 					resp := r.responseToReadIndexReq(m, r.raftLog.committed)
 					resp.From = r.id
 					r.send(resp)
+					r.readOnly.markReadIndexStat(true)
+					r.logger.Debugf("%x served read index request locally with lease (lease acked index: %d, commit: %d)", r.id, rl.AckedIndex, r.raftLog.committed)
 				} else { // In this case, we haven't caught up yet; try to hold onto this for a bit.
 					commitVal := m.Commit
 					if commitVal == ^uint64(0) {
@@ -1935,6 +1937,7 @@ func stepFollower(r *raft, m pb.Message) error {
 					} else {
 						m.To = r.lead
 						r.send(m)
+						r.readOnly.markReadIndexStat(false)
 						r.logger.Infof("%x forwarding read index request to leader %x since we haven't caught up yet (lease acked index: %d)", r.id, r.lead, rl.AckedIndex)
 					}
 				}
@@ -1942,13 +1945,15 @@ func stepFollower(r *raft, m pb.Message) error {
 				// Still forward to the leader since we can't serve the request
 				m.To = r.lead
 				r.send(m)
+				r.readOnly.markReadIndexStat(false)
 			}
 			// TODO: A request ctx may be better than canAskForLease(), which uses a static interval
 			if untilExpired < _LEASE_RENEWAL_THRESHOLD_MICROS && r.readOnly.canAskForLease() {
 				lreq := pb.Message{From: r.id, To: r.lead, Index: r.raftLog.committed,
-					Type: pb.MsgAskReadLease}
+					LogTerm: r.readOnly.getMarkedLeaseId(),
+					Type:    pb.MsgAskReadLease}
 				r.send(lreq)
-				r.logger.Infof("%x sending MsgAskReadLease to leader %x", r.id, r.lead)
+				r.logger.Infof("%x sending MsgAskReadLease to leader %x (leaseId: %d)", r.id, r.lead, lreq.LogTerm)
 				r.readOnly.markAskedForLease()
 			}
 		} else {
@@ -1982,7 +1987,11 @@ func stepFollower(r *raft, m pb.Message) error {
 		}
 
 		readLease = r.readOnly.processGrantedLease(*readLease)
-		r.logger.Infof("%x granted read lease from leader %x: %+v", r.id, m.From, readLease)
+		if readLease != nil {
+			r.logger.Infof("%x granted read lease from leader %x (leaseId: %d): %+v", r.id, m.From, readLease.LeaseId, readLease)
+		} else {
+			r.logger.Infof("%x got read lease from leader %x, but readOnly dropped it (no matching pending leaseId)", r.id, m.From)
+		}
 	case pb.MsgAskAckIndex:
 		if r.readOnly.option != ReadOnlyGrantLeases {
 			r.logger.Warningf("%x received unexpected MsgAskAckIndex from %x", r.id, m.From, r.readOnly.option)
@@ -2061,10 +2070,23 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 
 func (r *raft) handleHeartbeat(m pb.Message) {
 	r.raftLog.commitTo(m.Commit)
-	r.readOnly.markReadLeaseIndex(r.id, r.raftLog.committed)
-	toFire := r.readIndexDelayer.fireDelayedReadIndexRequests(r.raftLog.committed)
-	for _, next := range toFire {
-		r.Step(next)
+
+	if r.readOnly.option == ReadOnlyGrantLeases {
+		r.readOnly.markReadLeaseIndex(r.id, r.raftLog.committed)
+		toFire := r.readIndexDelayer.fireDelayedReadIndexRequests(r.raftLog.committed)
+		for _, next := range toFire {
+			r.Step(next)
+		}
+		untilExpired := r.readOnly.microsUntilLeaseExpired(r.id)
+		if untilExpired < _LEASE_RENEWAL_THRESHOLD_MICROS && r.readOnly.canAskForLease() {
+			// && untilExpired > 0 {  // TODO: This should probably be on, but I have it off for testing
+			lreq := pb.Message{From: r.id, To: r.lead, Index: r.raftLog.committed,
+				LogTerm: r.readOnly.getMarkedLeaseId(),
+				Type:    pb.MsgAskReadLease}
+			r.send(lreq)
+			r.logger.Infof("%x sending MsgAskReadLease to leader %x (leaseId: %d)", r.id, r.lead, lreq.LogTerm)
+			r.readOnly.markAskedForLease()
+		}
 	}
 	r.send(pb.Message{To: m.From, Type: pb.MsgHeartbeatResp, Context: m.Context})
 }

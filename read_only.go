@@ -27,7 +27,7 @@ import (
 const _SAFEGUARD_CLOCK_DRIFT_MICROS = 1000         // 1ms clock drift allowed
 const _LEASE_ASK_INTERVAL_MICROS = 10000           // 10ms between lease asks
 const _ACK_INDEX_ASK_INTERVAL_MICROS = 5000        // 5ms between ack index asks
-const _LEASE_RENEWAL_THRESHOLD_MICROS = 30000      // 30ms before expiry
+const _LEASE_RENEWAL_THRESHOLD_MICROS = 150000     // 150ms before expiry
 const _READ_INDEX_LOCAL_HOLD_DURATION_MICROS = 750 // 750us to hold a read index request before sending it to leader
 const _READ_INDEX_LOCAL_HOLD_LOG_THRESHOLD = 100   // Log index threshold for holding a read index request
 
@@ -42,6 +42,7 @@ type ReadState struct {
 }
 
 type ReadLease struct {
+	LeaseId      uint64
 	NodeId       uint64
 	LogIndex     uint64
 	StartTime    uint64
@@ -65,6 +66,8 @@ type ReadLeaseMap struct {
 	leases            map[uint64]*ReadLease
 	heap              *readLeaseHeap
 	soonestExpiryTime uint64
+	pendingLeases     map[uint64]uint64 // leaseID -> startTime
+	pendingLeaseCtr   uint64
 }
 
 type ReadLeaseStats struct {
@@ -131,7 +134,8 @@ func newReadLeaseMap() *ReadLeaseMap {
 		leases:            make(map[uint64]*ReadLease),
 		heap:              h,
 		soonestExpiryTime: 0,
-	}
+		pendingLeases:     make(map[uint64]uint64),
+		pendingLeaseCtr:   1}
 }
 
 func (rlm *ReadLeaseMap) Put(id uint64, lease *ReadLease) {
@@ -209,26 +213,35 @@ func (rlm *ReadLeaseMap) ResetSoonestExpiryTime() {
 	rlm.soonestExpiryTime = 0
 }
 
+func (rlm *ReadLeaseMap) GetNewLeaseId() uint64 {
+	leaseId := rlm.pendingLeaseCtr
+	rlm.pendingLeaseCtr++
+	return leaseId
+}
+
 func (rl *ReadLease) Marshal() []byte {
-	buf := make([]byte, 40)
-	binary.BigEndian.PutUint64(buf[0:8], rl.NodeId)
-	binary.BigEndian.PutUint64(buf[8:16], rl.LogIndex)
-	binary.BigEndian.PutUint64(buf[16:24], rl.StartTime)
-	binary.BigEndian.PutUint64(buf[24:32], rl.Duration)
-	binary.BigEndian.PutUint64(buf[32:40], rl.AckedIndex)
+	// Wire format: [LeaseId, NodeId, LogIndex, StartTime, Duration, AckedIndex] each 8 bytes
+	buf := make([]byte, 48)
+	binary.BigEndian.PutUint64(buf[0:8], rl.LeaseId)
+	binary.BigEndian.PutUint64(buf[8:16], rl.NodeId)
+	binary.BigEndian.PutUint64(buf[16:24], rl.LogIndex)
+	binary.BigEndian.PutUint64(buf[24:32], rl.StartTime)
+	binary.BigEndian.PutUint64(buf[32:40], rl.Duration)
+	binary.BigEndian.PutUint64(buf[40:48], rl.AckedIndex)
 	return buf
 }
 
 func UnmarshalReadLease(data []byte) (*ReadLease, error) {
-	if len(data) != 40 {
-		return nil, fmt.Errorf("invalid ReadLease data length: got %d, want 40", len(data))
+	if len(data) != 48 {
+		return nil, fmt.Errorf("invalid ReadLease data length: got %d, want 48", len(data))
 	}
 	return &ReadLease{
-		NodeId:       binary.BigEndian.Uint64(data[0:8]),
-		LogIndex:     binary.BigEndian.Uint64(data[8:16]),
-		StartTime:    binary.BigEndian.Uint64(data[16:24]),
-		Duration:     binary.BigEndian.Uint64(data[24:32]),
-		AckedIndex:   binary.BigEndian.Uint64(data[32:40]),
+		LeaseId:      binary.BigEndian.Uint64(data[0:8]),
+		NodeId:       binary.BigEndian.Uint64(data[8:16]),
+		LogIndex:     binary.BigEndian.Uint64(data[16:24]),
+		StartTime:    binary.BigEndian.Uint64(data[24:32]),
+		Duration:     binary.BigEndian.Uint64(data[32:40]),
+		AckedIndex:   binary.BigEndian.Uint64(data[40:48]),
 		LastAckAsked: 0,
 	}, nil
 }
@@ -273,6 +286,15 @@ func newReadOnly(option ReadOnlyOption, duration uint64,
 		safeguardPassed:    false,
 		leaseCatchupMargin: catchupmargin,
 	}
+}
+
+func (ro *readOnly) getMarkedLeaseId() uint64 {
+	if ro.option != ReadOnlyGrantLeases {
+		return 0
+	}
+	nid := ro.readLeases.GetNewLeaseId()
+	ro.readLeases.pendingLeases[nid] = uint64(time.Now().UnixMicro())
+	return nid
 }
 
 func (ro *readOnly) safeguardHasPassed() bool {
@@ -343,29 +365,40 @@ func (ro *readOnly) hasActiveReadLease(id uint64) bool {
 	return ro.microsUntilLeaseExpired(id) > 0
 }
 
-func (ro *readOnly) grantNewLease(id uint64, ackedIndex uint64, logIndex uint64) *ReadLease {
+func (ro *readOnly) grantNewLease(nodeId uint64, leaseId uint64,
+	ackedIndex uint64, logIndex uint64) *ReadLease {
 	if ro.option != ReadOnlyGrantLeases {
 		return nil
 	}
 
 	// Otherwise, make a new lease entry.
 	newLease := ReadLease{
-		NodeId:       id,
+		LeaseId:      leaseId,
+		NodeId:       nodeId,
 		LogIndex:     logIndex,
 		StartTime:    uint64(time.Now().UnixMicro()),
 		Duration:     ro.readLeaseDuration,
 		AckedIndex:   ackedIndex,
 		LastAckAsked: 0}
-	ro.readLeases.Put(id, &newLease)
-	return ro.getReadLease(id)
+	ro.readLeases.Put(nodeId, &newLease)
+	return ro.getReadLease(nodeId)
 }
 
 func (ro *readOnly) processGrantedLease(lease ReadLease) *ReadLease {
 	if ro.option != ReadOnlyGrantLeases {
 		return nil
 	}
-	if lease.StartTime == 0 || lease.Duration == 0 ||
-		lease.StartTime+lease.Duration <= uint64(time.Now().UnixMicro()) {
+
+	// TODO: Have a feature toggle that skips this and uses lease.StartTime instead,
+	// for whenever clock synchronization is enabled
+	savedStartTime, ok := ro.readLeases.pendingLeases[lease.LeaseId]
+	if !ok {
+		// There's a couple reasons this could happen, some of them are benign, so ignore it.
+		return nil
+	}
+
+	if lease.Duration == 0 ||
+		savedStartTime+lease.Duration <= uint64(time.Now().UnixMicro()) {
 		// Expired lease, do not process.
 		return nil
 	}
@@ -374,13 +407,18 @@ func (ro *readOnly) processGrantedLease(lease ReadLease) *ReadLease {
 	// This function is run by followers/learners, which means their
 	// leases will conservatively expire earlier to account for drift.
 	ro.readLeases.Put(lease.NodeId, &ReadLease{
+		LeaseId:      lease.LeaseId,
 		NodeId:       lease.NodeId,
 		LogIndex:     lease.LogIndex,
-		StartTime:    lease.StartTime,
+		StartTime:    savedStartTime,
 		Duration:     lease.Duration - _SAFEGUARD_CLOCK_DRIFT_MICROS,
 		AckedIndex:   lease.AckedIndex,
 		LastAckAsked: 0,
 	})
+
+	// Clear all pending leases once we get one.
+	clear(ro.readLeases.pendingLeases)
+
 	return ro.getReadLease(lease.NodeId)
 }
 
