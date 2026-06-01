@@ -24,12 +24,12 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
-const _SAFEGUARD_CLOCK_DRIFT_MICROS = 1000         // 1ms clock drift allowed
-const _LEASE_ASK_INTERVAL_MICROS = 10000           // 10ms between lease asks
-const _ACK_INDEX_ASK_INTERVAL_MICROS = 5000        // 5ms between ack index asks
-const _LEASE_RENEWAL_THRESHOLD_MICROS = 150000     // 150ms before expiry
-const _READ_INDEX_LOCAL_HOLD_DURATION_MICROS = 750 // 750us to hold a read index request before sending it to leader
-const _READ_INDEX_LOCAL_HOLD_LOG_THRESHOLD = 100   // Log index threshold for holding a read index request
+const _SAFEGUARD_CLOCK_DRIFT_MICROS = 1000          // 1ms clock drift allowed
+const _LEASE_ASK_INTERVAL_MICROS = 10000            // 10ms between lease asks
+const _ACK_INDEX_ASK_INTERVAL_MICROS = 5000         // 5ms between ack index asks
+const _LEASE_RENEWAL_THRESHOLD_MICROS = 150000      // 150ms before expiry
+const _READ_INDEX_LOCAL_HOLD_DURATION_MICROS = 5000 // 5ms to hold a read index request before sending it to leader
+const _READ_INDEX_LOCAL_HOLD_LOG_THRESHOLD = 100    // Log index threshold for holding a read index request
 
 // ReadState provides state for read only query.
 // It's caller's responsibility to call ReadIndex first before getting

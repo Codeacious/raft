@@ -945,6 +945,10 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 func (r *raft) tickElection() {
 	r.electionElapsed++
 
+	// Renew read leases on the follower's own tick, independent of leader messages.
+	// TODO: Make this part of a toggle for aggresively/always asking for read leases.
+	r.maybeAskForReadLease()
+
 	if r.promotable() && r.pastElectionTimeout() {
 		r.electionElapsed = 0
 		if err := r.Step(pb.Message{From: r.id, Type: pb.MsgHup}); err != nil {
@@ -1948,14 +1952,7 @@ func stepFollower(r *raft, m pb.Message) error {
 				r.readOnly.markReadIndexStat(false)
 			}
 			// TODO: A request ctx may be better than canAskForLease(), which uses a static interval
-			if untilExpired < _LEASE_RENEWAL_THRESHOLD_MICROS && r.readOnly.canAskForLease() {
-				lreq := pb.Message{From: r.id, To: r.lead, Index: r.raftLog.committed,
-					LogTerm: r.readOnly.getMarkedLeaseId(),
-					Type:    pb.MsgAskReadLease}
-				r.send(lreq)
-				r.logger.Infof("%x sending MsgAskReadLease to leader %x (leaseId: %d)", r.id, r.lead, lreq.LogTerm)
-				r.readOnly.markAskedForLease()
-			}
+			r.maybeAskForReadLease()
 		} else {
 			m.To = r.lead
 			r.send(m)
@@ -2068,6 +2065,25 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 	})
 }
 
+// maybeAskForReadLease asks the leader for a (renewed) read lease if the
+// follower's current lease is near expiry (or absent) and the rate-limiter
+// permits. It is a no-op unless read leases are enabled and a leader is known.
+func (r *raft) maybeAskForReadLease() {
+	if r.readOnly.option != ReadOnlyGrantLeases || r.lead == None {
+		return
+	}
+	untilExpired := r.readOnly.microsUntilLeaseExpired(r.id)
+	if untilExpired < _LEASE_RENEWAL_THRESHOLD_MICROS && r.readOnly.canAskForLease() {
+		// && untilExpired > 0 {  // TODO: This should probably be on, but I have it off for testing
+		lreq := pb.Message{From: r.id, To: r.lead, Index: r.raftLog.committed,
+			LogTerm: r.readOnly.getMarkedLeaseId(),
+			Type:    pb.MsgAskReadLease}
+		r.send(lreq)
+		r.logger.Infof("%x sending MsgAskReadLease to leader %x (leaseId: %d)", r.id, r.lead, lreq.LogTerm)
+		r.readOnly.markAskedForLease()
+	}
+}
+
 func (r *raft) handleHeartbeat(m pb.Message) {
 	r.raftLog.commitTo(m.Commit)
 
@@ -2077,16 +2093,7 @@ func (r *raft) handleHeartbeat(m pb.Message) {
 		for _, next := range toFire {
 			r.Step(next)
 		}
-		untilExpired := r.readOnly.microsUntilLeaseExpired(r.id)
-		if untilExpired < _LEASE_RENEWAL_THRESHOLD_MICROS && r.readOnly.canAskForLease() {
-			// && untilExpired > 0 {  // TODO: This should probably be on, but I have it off for testing
-			lreq := pb.Message{From: r.id, To: r.lead, Index: r.raftLog.committed,
-				LogTerm: r.readOnly.getMarkedLeaseId(),
-				Type:    pb.MsgAskReadLease}
-			r.send(lreq)
-			r.logger.Infof("%x sending MsgAskReadLease to leader %x (leaseId: %d)", r.id, r.lead, lreq.LogTerm)
-			r.readOnly.markAskedForLease()
-		}
+		r.maybeAskForReadLease()
 	}
 	r.send(pb.Message{To: m.From, Type: pb.MsgHeartbeatResp, Context: m.Context})
 }
