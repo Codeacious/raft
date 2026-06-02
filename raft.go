@@ -24,7 +24,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"go.etcd.io/raft/v3/confchange"
 	"go.etcd.io/raft/v3/quorum"
@@ -828,7 +827,7 @@ func (r *raft) askReadLeaseHoldersForAckIndex(cutoffIndex uint64) {
 	if len(toAsk) == 0 {
 		return
 	}
-	now := uint64(time.Now().UnixMicro())
+	now := nowMicros()
 	for _, nodeID := range toAsk {
 		rl := r.readOnly.getReadLease(nodeID)
 		if rl == nil {

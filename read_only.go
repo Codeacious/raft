@@ -31,6 +31,21 @@ const _LEASE_RENEWAL_THRESHOLD_MICROS = 150000      // 150ms before expiry
 const _READ_INDEX_LOCAL_HOLD_DURATION_MICROS = 5000 // 5ms to hold a read index request before sending it to leader
 const _READ_INDEX_LOCAL_HOLD_LOG_THRESHOLD = 100    // Log index threshold for holding a read index request
 
+// leaseClockEpoch is a process-local monotonic clock
+// for all read-lease timing.
+// Every lease timestamp comparison is node-local. A follower
+// substitutes its own saved start time in processGrantedLease and discards the
+// leader's wire StartTime.
+// The cluster must still be clock-rate synchronized
+// when using ReadOnlyGrantLeases.
+var leaseClockEpoch = time.Now()
+
+// Using nowMicros() ensures no adjustments to wall time
+// affect read lease timing.
+func nowMicros() uint64 {
+	return uint64(time.Since(leaseClockEpoch).Microseconds())
+}
+
 // ReadState provides state for read only query.
 // It's caller's responsibility to call ReadIndex first before getting
 // this state from ready, it's also caller's duty to differentiate if this
@@ -193,7 +208,7 @@ func (rlm *ReadLeaseMap) UpdateSoonestExpiryTime(expTime uint64) {
 }
 
 func (rlm *ReadLeaseMap) CleanupExpiredLeases() {
-	currentTime := uint64(time.Now().UnixMicro())
+	currentTime := nowMicros()
 	if currentTime < rlm.soonestExpiryTime {
 		return
 	}
@@ -282,7 +297,7 @@ func newReadOnly(option ReadOnlyOption, duration uint64,
 		maxReadLeases:      maxleases,
 		shouldAskForLease:  askforlease,
 		lastLeaseAskedTime: 0,
-		creationTime:       uint64(time.Now().UnixMicro()),
+		creationTime:       nowMicros(),
 		safeguardPassed:    false,
 		leaseCatchupMargin: catchupmargin,
 	}
@@ -293,7 +308,7 @@ func (ro *readOnly) getMarkedLeaseId() uint64 {
 		return 0
 	}
 	nid := ro.readLeases.GetNewLeaseId()
-	ro.readLeases.pendingLeases[nid] = uint64(time.Now().UnixMicro())
+	ro.readLeases.pendingLeases[nid] = nowMicros()
 	return nid
 }
 
@@ -302,7 +317,7 @@ func (ro *readOnly) safeguardHasPassed() bool {
 		return true
 	}
 	if !ro.safeguardPassed {
-		now := uint64(time.Now().UnixMicro())
+		now := nowMicros()
 		if now-ro.creationTime > ro.readLeaseDuration+_SAFEGUARD_CLOCK_DRIFT_MICROS {
 			ro.safeguardPassed = true
 		}
@@ -315,12 +330,12 @@ func (ro *readOnly) canAskForLease() bool {
 		return false
 	}
 
-	now := uint64(time.Now().UnixMicro())
+	now := nowMicros()
 	return now-ro.lastLeaseAskedTime > _LEASE_ASK_INTERVAL_MICROS
 }
 
 func (ro *readOnly) markAskedForLease() {
-	ro.lastLeaseAskedTime = uint64(time.Now().UnixMicro())
+	ro.lastLeaseAskedTime = nowMicros()
 }
 
 func (ro *readOnly) getNumReadLeases() int {
@@ -352,7 +367,7 @@ func (ro *readOnly) microsUntilLeaseExpired(id uint64) uint64 {
 		return 0
 	}
 
-	now := uint64(time.Now().UnixMicro())
+	now := nowMicros()
 	if lease.StartTime+lease.Duration > now {
 		return (lease.StartTime + lease.Duration) - now
 	} else {
@@ -376,7 +391,7 @@ func (ro *readOnly) grantNewLease(nodeId uint64, leaseId uint64,
 		LeaseId:      leaseId,
 		NodeId:       nodeId,
 		LogIndex:     logIndex,
-		StartTime:    uint64(time.Now().UnixMicro()),
+		StartTime:    nowMicros(),
 		Duration:     ro.readLeaseDuration,
 		AckedIndex:   ackedIndex,
 		LastAckAsked: 0}
@@ -398,7 +413,7 @@ func (ro *readOnly) processGrantedLease(lease ReadLease) *ReadLease {
 	}
 
 	if lease.Duration == 0 ||
-		savedStartTime+lease.Duration <= uint64(time.Now().UnixMicro()) {
+		savedStartTime+lease.Duration <= nowMicros() {
 		// Expired lease, do not process.
 		return nil
 	}
@@ -574,7 +589,7 @@ func (ro *readOnly) markReadIndexStat(usedReadLease bool) {
 func (rd *readIndexDelayer) addDelayedReadIndexReq(msg pb.Message, requiredIndex uint64) {
 	rd.delayedReadIndexReqs = append(rd.delayedReadIndexReqs, DelayedMsgReadIndex{
 		msg:           msg,
-		forwardAtTime: uint64(time.Now().UnixMicro()) + _READ_INDEX_LOCAL_HOLD_DURATION_MICROS,
+		forwardAtTime: nowMicros() + _READ_INDEX_LOCAL_HOLD_DURATION_MICROS,
 		requiredIndex: requiredIndex,
 	})
 	rd.rearmDelayedReadIndexTimer()
@@ -608,7 +623,7 @@ func (rd *readIndexDelayer) fireDelayedReadIndexRequests(commitIndex uint64) []p
 	defer rd.delayedReadsHandlerLock.Unlock()
 
 	var workingSet []pb.Message
-	now := uint64(time.Now().UnixMicro())
+	now := nowMicros()
 	for len(rd.delayedReadIndexReqs) > 0 {
 		next := rd.delayedReadIndexReqs[0]
 		if next.requiredIndex <= commitIndex {

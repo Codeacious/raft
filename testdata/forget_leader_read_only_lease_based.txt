@@ -21,7 +21,7 @@ ok
 # ForgetLeader fails with lease-based reads, as it's not safe.
 forget-leader 2
 ----
-ERROR ignoring MsgForgetLeader due to ReadOnlyLeaseBased
+ERROR ignoring MsgForgetLeader due to ReadOnlyLeaseBased or ReadOnlyGrantLeases
 
 raft-state
 ----

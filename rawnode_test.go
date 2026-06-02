@@ -73,6 +73,10 @@ func (a *rawNodeAdapter) Propose(_ context.Context, data []byte) error {
 func (a *rawNodeAdapter) ProposeConfChange(_ context.Context, cc pb.ConfChangeI) error {
 	return a.RawNode.ProposeConfChange(cc)
 }
+func (a *rawNodeAdapter) IsAskingForReadLease() bool { return false }
+func (a *rawNodeAdapter) ReadIndexSwitchHint(_ context.Context, rctx []byte, switchIndex uint64) error {
+	return nil
+}
 
 // TestRawNodeStep ensures that RawNode.Step ignore local message.
 func TestRawNodeStep(t *testing.T) {
