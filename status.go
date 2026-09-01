@@ -28,6 +28,11 @@ type Status struct {
 	Config         tracker.Config
 	Progress       map[uint64]tracker.Progress
 	ReadLeaseStats ReadLeaseStats
+	// ActiveReadLeases lists the peers this leader currently holds an unexpired
+	// read lease for. Nil on a follower, and outside ReadOnlyGrantLeases.
+	// Callers use it to find the peers whose reads a switch can actually gate;
+	// a peer with no lease cannot serve locally, so its switch state is moot.
+	ActiveReadLeases []uint64
 }
 
 // BasicStatus contains basic information about the Raft peer. It does not allocate.
@@ -75,6 +80,9 @@ func getStatus(r *raft) Status {
 	s.Config = r.trk.Config.Clone()
 	if r.readOnly != nil {
 		s.ReadLeaseStats = r.readOnly.readLeaseStats
+		if s.RaftState == StateLeader {
+			s.ActiveReadLeases = r.readOnly.activeReadLeaseHolders()
+		}
 	}
 	return s
 }
@@ -96,7 +104,6 @@ func (s Status) MarshalJSON() ([]byte, error) {
 		j = j[:len(j)-1] + "},"
 	}
 
-	// j += fmt.Sprintf(`"leadtransferee":"%x"}`, s.LeadTransferee)
 	j += fmt.Sprintf(`"leadtransferee":"%x","readLeaseStats":{"timesReadLeaseUsed":%d,"timesGotReadQuery":%d}}`,
 		s.LeadTransferee, s.ReadLeaseStats.TimesReadLeaseUsed, s.ReadLeaseStats.TimesGotReadQuery)
 	return []byte(j), nil

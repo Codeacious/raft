@@ -82,7 +82,7 @@ type ReadLeaseMap struct {
 	heap              *readLeaseHeap
 	soonestExpiryTime uint64
 	pendingLeases     map[uint64]uint64 // leaseID -> startTime
-	pendingLeaseCtr   uint64
+	nextLeaseId       uint64
 }
 
 type ReadLeaseStats struct {
@@ -139,6 +139,22 @@ func (h *readLeaseHeap) remove(nodeId uint64) {
 	}
 }
 
+// newLeaseIdSeed returns the first lease id to mint. The upper 32 bits are
+// randomized and forced nonzero so that lease ids are not reused across
+// restarts or terms.
+//
+// A counter restarting at 1 would let a grant still in flight from a previous
+// incarnation match a freshly re-issued pending id in processGrantedLease,
+// which dates the lease from the *later* ask — the follower would then serve
+// reads past the leader's view of that lease's expiry, unclamped. Mirrors the
+// client read-gate marker seeding in etcd's client/v3/sidechannel.
+//
+// 31 bits of entropy rather than 32: Intn takes an int, and 1<<32 does not fit
+// one on 32-bit platforms. Collision odds are negligible either way.
+func newLeaseIdSeed() uint64 {
+	return uint64(globalRand.Intn(1<<31-1)+1)<<32 | 1
+}
+
 func newReadLeaseMap() *ReadLeaseMap {
 	h := &readLeaseHeap{
 		items:   make([]*heapItem, 0),
@@ -150,7 +166,7 @@ func newReadLeaseMap() *ReadLeaseMap {
 		heap:              h,
 		soonestExpiryTime: 0,
 		pendingLeases:     make(map[uint64]uint64),
-		pendingLeaseCtr:   1}
+		nextLeaseId:       newLeaseIdSeed()}
 }
 
 func (rlm *ReadLeaseMap) Put(id uint64, lease *ReadLease) {
@@ -229,8 +245,8 @@ func (rlm *ReadLeaseMap) ResetSoonestExpiryTime() {
 }
 
 func (rlm *ReadLeaseMap) GetNewLeaseId() uint64 {
-	leaseId := rlm.pendingLeaseCtr
-	rlm.pendingLeaseCtr++
+	leaseId := rlm.nextLeaseId
+	rlm.nextLeaseId++
 	return leaseId
 }
 
@@ -284,6 +300,28 @@ type readOnly struct {
 	creationTime       uint64
 	safeguardPassed    bool
 	leaseCatchupMargin int
+	// safeguardTicksRemaining is phase 1 of the new-leader safeguard: the number
+	// of leader ticks still needed before the wall-clock phase may begin.
+	safeguardTicksRemaining int
+	// safeguardMicrosStart is nowMicros() at which phase 2 began, or 0 while
+	// phase 1 is still incomplete.
+	safeguardMicrosStart uint64
+	// leaseBanned holds nodes barred from being granted a read lease for the
+	// rest of this term.
+	leaseBanned map[uint64]struct{}
+	// confirmedAtTerm holds peers heard from at this node's *current* term.
+	confirmedAtTerm map[uint64]struct{}
+	// safeguardRequired holds node ids named by conf-change entries in the
+	// unapplied log tail at election time.
+	safeguardRequired map[uint64]struct{}
+	// safeguardScanFailed records that the election-time tail scan failed, so
+	// the two sets above may be incomplete. Disables the shortcut entirely.
+	safeguardScanFailed bool
+	// readLeaseAckedIndex is this node's own read-lease ack index
+	// across all read leases. It *cannot* be cleared so long as
+	// the node has any read leases or pending read leases, but
+	// it should never need to be cleared regardless.
+	readLeaseAckedIndex uint64
 }
 
 func newReadOnly(option ReadOnlyOption, duration uint64,
@@ -300,6 +338,9 @@ func newReadOnly(option ReadOnlyOption, duration uint64,
 		creationTime:       nowMicros(),
 		safeguardPassed:    false,
 		leaseCatchupMargin: catchupmargin,
+		leaseBanned:        make(map[uint64]struct{}),
+		confirmedAtTerm:    make(map[uint64]struct{}),
+		safeguardRequired:  make(map[uint64]struct{}),
 	}
 }
 
@@ -312,17 +353,106 @@ func (ro *readOnly) getMarkedLeaseId() uint64 {
 	return nid
 }
 
+// startNewLeaderSafeguard arms the two-phase new-leader safeguard. Called from
+// becomeLeader with the node's electionTimeout, in ticks.
+//
+// The wait is a *sum*, not a maximum, and the phases must run in sequence. A
+// leader of the previous term keeps granting leases until CheckQuorum steps it
+// down, which takes up to one election timeout after this node won; a lease
+// granted at that last moment then runs a further leaseDuration-drift. So the
+// last moment any prior-term lease can still be live is
+// election+electionTimeout+leaseDuration-drift. Running the two clocks
+// concurrently would wait only max(electionTimeout, leaseDuration+drift) and
+// finish too early.
+//
+// Phase 1 is counted in ticks because the thing it bounds (the old leader's
+// CheckQuorum step-down) is tick-driven, and raft has no wall-clock
+// value for a tick. Phase 2 is counted in micros because lease expiry also is; a
+// monotonic clock keeps running through a scheduling stall, whereas a stalled
+// node's ticks fire late and could let its lease outlive the leader's view.
+func (ro *readOnly) startNewLeaderSafeguard(electionTicks int) {
+	ro.safeguardPassed = false
+	ro.safeguardTicksRemaining = electionTicks
+	// Degenerate config: no tick phase, so phase 2 starts immediately.
+	if electionTicks == 0 {
+		ro.safeguardMicrosStart = nowMicros()
+	} else {
+		ro.safeguardMicrosStart = 0
+	}
+}
+
+// tickSafeguard advances phase 1 by one tick, starting phase 2 when it
+// completes. Driven from the leader branch of tickHeartbeat.
+func (ro *readOnly) tickSafeguard() {
+	if ro.safeguardTicksRemaining == 0 {
+		return
+	}
+	ro.safeguardTicksRemaining--
+	if ro.safeguardTicksRemaining == 0 {
+		ro.safeguardMicrosStart = nowMicros()
+	}
+}
+
+// safeguardHasPassed reports whether the new-leader safeguard has elapsed on
+// the *timer*. raft.newLeaderSafeguardPassed also consults the confirmation
+// shortcut, and is what callers should use.
 func (ro *readOnly) safeguardHasPassed() bool {
 	if ro.option != ReadOnlyGrantLeases {
 		return true
 	}
-	if !ro.safeguardPassed {
-		now := nowMicros()
-		if now-ro.creationTime > ro.readLeaseDuration+_SAFEGUARD_CLOCK_DRIFT_MICROS {
-			ro.safeguardPassed = true
-		}
+	if ro.safeguardPassed {
+		return true
+	}
+	// Phase 1 (ticks) not finished yet.
+	if ro.safeguardMicrosStart == 0 {
+		return false
+	}
+	if nowMicros()-ro.safeguardMicrosStart > ro.readLeaseDuration+_SAFEGUARD_CLOCK_DRIFT_MICROS {
+		ro.safeguardPassed = true
 	}
 	return ro.safeguardPassed
+}
+
+// markSafeguardPassed latches the safeguard as passed. Used by the confirmation
+// shortcut, so a later configuration change cannot un-pass a window already
+// lifted.
+func (ro *readOnly) markSafeguardPassed() {
+	ro.safeguardPassed = true
+}
+
+// banLease bars id from being granted a read lease for the rest of this term,
+// because a configuration change removing it is in flight.
+func (ro *readOnly) banLease(id uint64) {
+	ro.leaseBanned[id] = struct{}{}
+}
+
+func (ro *readOnly) isLeaseBanned(id uint64) bool {
+	_, ok := ro.leaseBanned[id]
+	return ok
+}
+
+// confirmAtTerm records that id has been heard from at this node's current
+// term, and so has run reset() and dropped any prior-term lease.
+func (ro *readOnly) confirmAtTerm(id uint64) {
+	if ro.option == ReadOnlyGrantLeases && !ro.safeguardPassed {
+		ro.confirmedAtTerm[id] = struct{}{}
+	}
+}
+
+func (ro *readOnly) isConfirmedAtTerm(id uint64) bool {
+	_, ok := ro.confirmedAtTerm[id]
+	return ok
+}
+
+// requireConfirmation adds a node the safeguard shortcut must hear from beyond
+// the current configuration (named by an unapplied conf change at election
+// time).
+func (ro *readOnly) requireConfirmation(id uint64) {
+	ro.safeguardRequired[id] = struct{}{}
+}
+
+func (ro *readOnly) markSafeguardScanFailed() {
+	ro.safeguardScanFailed = true
 }
 
 func (ro *readOnly) canAskForLease() bool {
@@ -380,6 +510,22 @@ func (ro *readOnly) hasActiveReadLease(id uint64) bool {
 	return ro.microsUntilLeaseExpired(id) > 0
 }
 
+// activeReadLeaseHolders returns the ids of every node whose lease has not yet
+// expired. Allocates, and is meant for Status() rather than any hot path.
+func (ro *readOnly) activeReadLeaseHolders() []uint64 {
+	if ro.option != ReadOnlyGrantLeases {
+		return nil
+	}
+	var ids []uint64
+	ro.readLeases.Range(func(id uint64, _ *ReadLease) bool {
+		if ro.hasActiveReadLease(id) {
+			ids = append(ids, id)
+		}
+		return true
+	})
+	return ids
+}
+
 func (ro *readOnly) grantNewLease(nodeId uint64, leaseId uint64,
 	ackedIndex uint64, logIndex uint64) *ReadLease {
 	if ro.option != ReadOnlyGrantLeases {
@@ -418,6 +564,9 @@ func (ro *readOnly) processGrantedLease(lease ReadLease) *ReadLease {
 		return nil
 	}
 
+	// The granted ack index only ever raises our own.
+	ro.readLeaseAckedIndex = max(ro.readLeaseAckedIndex, lease.AckedIndex)
+
 	// We subtract a small safeguard time to account for clock drift.
 	// This function is run by followers/learners, which means their
 	// leases will conservatively expire earlier to account for drift.
@@ -427,7 +576,7 @@ func (ro *readOnly) processGrantedLease(lease ReadLease) *ReadLease {
 		LogIndex:     lease.LogIndex,
 		StartTime:    savedStartTime,
 		Duration:     lease.Duration - _SAFEGUARD_CLOCK_DRIFT_MICROS,
-		AckedIndex:   lease.AckedIndex,
+		AckedIndex:   ro.readLeaseAckedIndex,
 		LastAckAsked: 0,
 	})
 
@@ -444,10 +593,14 @@ func (ro *readOnly) removeReadLease(id uint64) {
 	ro.readLeases.Delete(id)
 }
 
+// markReadLeaseIndex raises a lease's recorded ack index. Marking our own id
+// advances readLeaseAckedIndex, which takes effect whether or not a lease is
+// currently installed, in case a lease expired but a new one is pending.
 func (ro *readOnly) markReadLeaseIndex(id uint64, index uint64) {
 	if ro.option != ReadOnlyGrantLeases {
 		return
 	}
+	ro.readLeaseAckedIndex = max(ro.readLeaseAckedIndex, index)
 	ro.readLeases.UpdateAckedIndex(id, index)
 }
 
@@ -587,6 +740,8 @@ func (ro *readOnly) markReadIndexStat(usedReadLease bool) {
 }
 
 func (rd *readIndexDelayer) addDelayedReadIndexReq(msg pb.Message, requiredIndex uint64) {
+	rd.delayedReadsHandlerLock.Lock()
+	defer rd.delayedReadsHandlerLock.Unlock()
 	rd.delayedReadIndexReqs = append(rd.delayedReadIndexReqs, DelayedMsgReadIndex{
 		msg:           msg,
 		forwardAtTime: nowMicros() + _READ_INDEX_LOCAL_HOLD_DURATION_MICROS,
@@ -595,22 +750,39 @@ func (rd *readIndexDelayer) addDelayedReadIndexReq(msg pb.Message, requiredIndex
 	rd.rearmDelayedReadIndexTimer()
 }
 
+// rearmDelayedReadIndexTimer (re)schedules the timer to fire at the soonest forwardAtTime.
+// The caller must hold delayedReadsHandlerLock; both the timer field and the
+// request queue are read/written under it.
 func (rd *readIndexDelayer) rearmDelayedReadIndexTimer() {
-	if rd.delayedReadsTimer == nil {
-		rd.delayedReadsTimer = time.AfterFunc(
-			time.Duration(_READ_INDEX_LOCAL_HOLD_DURATION_MICROS)*time.Microsecond,
-			func() {
-				rd.delayedReadsTimer = nil
-				toSend := rd.fireDelayedReadIndexRequests(0)
-				for _, next := range toSend {
-					select {
-					case <-rd.delayedReadsChanDone:
-						return
-					case rd.delayedReadsChannel <- next:
-					}
-				}
+	if len(rd.delayedReadIndexReqs) == 0 {
+		if rd.delayedReadsTimer != nil {
+			rd.delayedReadsTimer.Stop()
+		}
+		return
+	}
 
-			})
+	now := nowMicros()
+	front := rd.delayedReadIndexReqs[0].forwardAtTime
+	var d time.Duration
+	if front > now {
+		d = time.Duration(front-now) * time.Microsecond
+	}
+
+	if rd.delayedReadsTimer == nil {
+		rd.delayedReadsTimer = time.AfterFunc(d, rd.onDelayedReadsTimer)
+	} else {
+		rd.delayedReadsTimer.Reset(d)
+	}
+}
+
+func (rd *readIndexDelayer) onDelayedReadsTimer() {
+	toSend := rd.fireDelayedReadIndexRequests(0)
+	for _, next := range toSend {
+		select {
+		case <-rd.delayedReadsChanDone:
+			return
+		case rd.delayedReadsChannel <- next:
+		}
 	}
 }
 
@@ -645,9 +817,7 @@ func (rd *readIndexDelayer) fireDelayedReadIndexRequests(commitIndex uint64) []p
 			break
 		}
 	}
-	if len(rd.delayedReadIndexReqs) > 0 {
-		rd.rearmDelayedReadIndexTimer()
-	}
+	rd.rearmDelayedReadIndexTimer()
 	return workingSet
 }
 
