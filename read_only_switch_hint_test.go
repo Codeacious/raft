@@ -46,6 +46,13 @@ func newSwitchHintTestRaft(t *testing.T, ackedIndex uint64) *raft {
 	cfg.ReadLeaseCatchupMargin = 10
 
 	r := newRaft(cfg)
+	done := make(chan struct{})
+	r.readIndexDelayer.delayedReadsChanDone = done
+	// Stop pending delayed reads and release callbacks waiting to send.
+	t.Cleanup(func() {
+		r.readIndexDelayer.clear()
+		close(done)
+	})
 	r.becomeFollower(1, 2)
 	r.raftLog.commitTo(switchHintTestCommitted)
 
@@ -124,7 +131,9 @@ func TestSwitchHintGate(t *testing.T) {
 			stepSwitchHintRead(t, r, tt.hint)
 
 			msgs := r.readMessages()
+			r.readIndexDelayer.delayedReadsHandlerLock.Lock()
 			held := len(r.readIndexDelayer.delayedReadIndexReqs)
+			r.readIndexDelayer.delayedReadsHandlerLock.Unlock()
 
 			var got string
 			switch {
@@ -157,7 +166,10 @@ func TestSwitchHintUnreachableNotHeld(t *testing.T) {
 		r := newSwitchHintTestRaft(t, ackedIndex)
 		stepSwitchHintRead(t, r, math.MaxUint64)
 
-		if n := len(r.readIndexDelayer.delayedReadIndexReqs); n != 0 {
+		r.readIndexDelayer.delayedReadsHandlerLock.Lock()
+		n := len(r.readIndexDelayer.delayedReadIndexReqs)
+		r.readIndexDelayer.delayedReadsHandlerLock.Unlock()
+		if n != 0 {
 			t.Fatalf("acked %d: unreachable hint was held by the delayer (%d queued); it must be forwarded", ackedIndex, n)
 		}
 		if n := len(r.readStates); n != 0 {
@@ -195,7 +207,10 @@ func TestSwitchHintUnreachableWithoutLease(t *testing.T) {
 	if forwarded != 1 {
 		t.Fatalf("expected the read forwarded to the leader once, got %d forwards", forwarded)
 	}
-	if n := len(r.readIndexDelayer.delayedReadIndexReqs); n != 0 {
+	r.readIndexDelayer.delayedReadsHandlerLock.Lock()
+	n := len(r.readIndexDelayer.delayedReadIndexReqs)
+	r.readIndexDelayer.delayedReadsHandlerLock.Unlock()
+	if n != 0 {
 		t.Fatalf("unreachable hint was held by the delayer (%d queued)", n)
 	}
 }

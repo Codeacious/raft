@@ -787,12 +787,12 @@ func (rd *readIndexDelayer) onDelayedReadsTimer() {
 }
 
 func (rd *readIndexDelayer) fireDelayedReadIndexRequests(commitIndex uint64) []pb.Message {
-	if len(rd.delayedReadIndexReqs) == 0 {
-		return nil
-	}
 	// We need to ensure the main raft loop and the timer don't fire this at the same time.
 	rd.delayedReadsHandlerLock.Lock()
 	defer rd.delayedReadsHandlerLock.Unlock()
+	if len(rd.delayedReadIndexReqs) == 0 {
+		return nil
+	}
 
 	var workingSet []pb.Message
 	now := nowMicros()
