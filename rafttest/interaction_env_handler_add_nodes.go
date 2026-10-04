@@ -64,6 +64,10 @@ func (env *InteractionEnv) handleAddNodes(t *testing.T, d datadriven.TestData) e
 					cfg.ReadOnlyOption = raft.ReadOnlySafe
 				case "lease-based":
 					cfg.ReadOnlyOption = raft.ReadOnlyLeaseBased
+					// The leader serves its reads out of a self-lease, so this
+					// mode needs a duration. Long enough not to expire during a
+					// datadriven script, which has no wall-clock pacing.
+					cfg.ReadLeaseDurationMicros = 60 * 1000 * 1000
 				default:
 					return fmt.Errorf("invalid read-only option %q", arg.Vals[i])
 				}

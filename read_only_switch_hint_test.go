@@ -17,6 +17,7 @@ package raft
 import (
 	"math"
 	"testing"
+	"time"
 
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -49,13 +50,20 @@ func newSwitchHintTestRaft(t *testing.T, ackedIndex uint64) *raft {
 	r.becomeFollower(1, 2)
 	r.raftLog.commitTo(switchHintTestCommitted)
 
-	r.readOnly.readLeases.Put(r.id, &ReadLease{
+	// These tests inspect the delayer's queue right after a Step, so hold reads
+	// far longer than a test runs; the 5 ms default is easily exceeded under
+	// -race. Clearing on cleanup stops the timer, which would otherwise block
+	// forever delivering to a bare raft's missing delayedReadsChannel.
+	r.readIndexDelayer.holdMicros = uint64(time.Hour / time.Microsecond)
+	t.Cleanup(r.readIndexDelayer.clear)
+
+	r.readOnly.heldLease = &ReadLease{
 		LeaseId:   1,
 		NodeId:    r.id,
 		LogIndex:  5, // <= committed, so the catchup margin is satisfied
 		StartTime: nowMicros(),
 		Duration:  cfg.ReadLeaseDurationMicros,
-	})
+	}
 	r.readOnly.readLeaseAckedIndex = ackedIndex
 	return r
 }
@@ -124,7 +132,7 @@ func TestSwitchHintGate(t *testing.T) {
 			stepSwitchHintRead(t, r, tt.hint)
 
 			msgs := r.readMessages()
-			held := len(r.readIndexDelayer.delayedReadIndexReqs)
+			held := r.readIndexDelayer.heldCount()
 
 			var got string
 			switch {
@@ -157,7 +165,7 @@ func TestSwitchHintUnreachableNotHeld(t *testing.T) {
 		r := newSwitchHintTestRaft(t, ackedIndex)
 		stepSwitchHintRead(t, r, math.MaxUint64)
 
-		if n := len(r.readIndexDelayer.delayedReadIndexReqs); n != 0 {
+		if n := r.readIndexDelayer.heldCount(); n != 0 {
 			t.Fatalf("acked %d: unreachable hint was held by the delayer (%d queued); it must be forwarded", ackedIndex, n)
 		}
 		if n := len(r.readStates); n != 0 {
@@ -183,7 +191,7 @@ func TestSwitchHintUnreachableNotHeld(t *testing.T) {
 // no lease asks for one on every read it cannot serve.)
 func TestSwitchHintUnreachableWithoutLease(t *testing.T) {
 	r := newSwitchHintTestRaft(t, 5)
-	r.readOnly.readLeases.Delete(r.id)
+	r.readOnly.heldLease = nil
 	stepSwitchHintRead(t, r, math.MaxUint64)
 
 	var forwarded int
@@ -195,7 +203,7 @@ func TestSwitchHintUnreachableWithoutLease(t *testing.T) {
 	if forwarded != 1 {
 		t.Fatalf("expected the read forwarded to the leader once, got %d forwards", forwarded)
 	}
-	if n := len(r.readIndexDelayer.delayedReadIndexReqs); n != 0 {
+	if n := r.readIndexDelayer.heldCount(); n != 0 {
 		t.Fatalf("unreachable hint was held by the delayer (%d queued)", n)
 	}
 }

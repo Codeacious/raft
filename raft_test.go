@@ -1997,12 +1997,14 @@ func TestReadOnlyOptionLease(t *testing.T) {
 	a := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))
 	b := newTestRaft(2, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))
 	c := newTestRaft(3, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))
-	a.readOnly.option = ReadOnlyLeaseBased
-	b.readOnly.option = ReadOnlyLeaseBased
-	c.readOnly.option = ReadOnlyLeaseBased
-	a.checkQuorum = true
-	b.checkQuorum = true
-	c.checkQuorum = true
+	for _, r := range []*raft{a, b, c} {
+		r.readOnly.option = ReadOnlyLeaseBased
+		// The leader serves reads under its own lease. At zero duration every
+		// read would quietly fall back to a read-index heartbeat and this test
+		// would stop exercising the lease path.
+		r.readOnly.readLeaseDuration = 500000
+		r.checkQuorum = true
+	}
 
 	nt := newNetwork(a, b, c)
 	setRandomizedElectionTimeout(b, b.electionTimeout+1)
@@ -2013,6 +2015,10 @@ func TestReadOnlyOptionLease(t *testing.T) {
 	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
 
 	require.Equal(t, StateLeader, a.state)
+	// The leader's lease takes effect only once a majority returns a round.
+	proposeSelfLease(a)
+	require.True(t, completeLeaseRound(t, a), "expected a lease round heartbeat")
+	require.True(t, a.readOnly.hasActiveHeldLease(), "leader should hold a self-lease")
 
 	tests := []struct {
 		sm        *raft

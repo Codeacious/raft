@@ -366,11 +366,16 @@ func (c *Config) validate() error {
 		return errors.New("CheckQuorum must be enabled when ReadOnlyOption is ReadOnlyLeaseBased or ReadOnlyGrantLeases")
 	}
 
+	// ReadOnlyLeaseBased now also needs a lease duration for the leader lease
+	if (c.ReadOnlyOption == ReadOnlyLeaseBased || c.ReadOnlyOption == ReadOnlyGrantLeases) &&
+		c.ReadLeaseDurationMicros <= _SAFEGUARD_CLOCK_DRIFT_MICROS {
+		return errors.New("must set a ReadLeaseDurationMicros greater than the clock-drift safeguard when ReadOnlyOption is ReadOnlyLeaseBased or ReadOnlyGrantLeases")
+	}
+
 	if c.ReadOnlyOption == ReadOnlyGrantLeases &&
-		(c.ReadLeaseDurationMicros <= _SAFEGUARD_CLOCK_DRIFT_MICROS ||
-			c.MaxNumReadLeases <= 0 ||
+		(c.MaxNumReadLeases <= 0 ||
 			c.ReadLeaseCatchupMargin < 0) {
-		return errors.New("must set valid ReadLeaseDurationMicros, MaxNumReadLeases, and ReadLeaseCatchupMargin when using ReadOnlyGrantLeases")
+		return errors.New("must set valid MaxNumReadLeases and ReadLeaseCatchupMargin when using ReadOnlyGrantLeases")
 	}
 
 	return nil
@@ -498,7 +503,7 @@ func newRaft(c *Config) *raft {
 		preVote:            c.PreVote,
 		readOnly: newReadOnly(c.ReadOnlyOption, c.ReadLeaseDurationMicros,
 			c.MaxNumReadLeases, c.AskForReadLease, c.ReadLeaseCatchupMargin),
-		readIndexDelayer:            newReadIndexDelayer(nil, nil),
+		readIndexDelayer:            newReadIndexDelayer(),
 		disableProposalForwarding:   c.DisableProposalForwarding,
 		disableConfChangeValidation: c.DisableConfChangeValidation,
 		stepDownOnRemoval:           c.StepDownOnRemoval,
@@ -706,6 +711,108 @@ func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 	return true
 }
 
+// maybeRenewSelfLease requests a renewal of the leader's own lease once it has
+// less than _LEASE_RENEWAL_THRESHOLD_MICROS left, unless one is already
+// pending. Called on each leader tick and before serving a leader read. Sends
+// nothing itself; the renewal waits for a later lease round.
+func (r *raft) maybeRenewSelfLease() {
+	if !r.readOnly.usesReadLeases() || r.state != StateLeader {
+		return
+	}
+	if r.readOnly.microsUntilHeldLeaseExpired() > _LEASE_RENEWAL_THRESHOLD_MICROS {
+		return // still comfortably valid
+	}
+	if r.readOnly.leader.selfLeaseBanned {
+		return // this leader is being removed; see banSelfLease
+	}
+	if armed := r.readOnly.leader.pendingSelfStart; armed != 0 &&
+		nowMicros()-armed <= r.readOnly.readLeaseDuration {
+		return // renewal already pending, and not yet stale
+	}
+	r.readOnly.armSelfLease()
+}
+
+// maybeSendLeaseRound sends a heartbeat now, instead of waiting for the next
+// scheduled one, if a pending renewal or follower request is for a lease that
+// is about to expire. It does nothing while the latest round still lacks a
+// majority, unless that round has waited _LEASE_ROUND_RETRY_MICROS and is
+// presumed lost.
+func (r *raft) maybeSendLeaseRound() {
+	if !r.readOnly.usesReadLeases() || r.state != StateLeader ||
+		!r.readOnly.leaseProposalUrgent() {
+		return
+	}
+	if r.readOnly.leader.leaseRoundInFlight() &&
+		nowMicros()-r.readOnly.leader.leaseRoundSentAt < _LEASE_ROUND_RETRY_MICROS {
+		return
+	}
+	// Also carries the latest pending read-index context, if any.
+	r.bcastHeartbeat()
+}
+
+// advanceLeaseQuorum recomputes the highest round a majority has returned and,
+// if it went up, grants everything waiting on that round or an earlier one.
+// Called after every reply and every broadcast; a single voter is its own
+// majority.
+func (r *raft) advanceLeaseQuorum() {
+	q := r.readOnly.leader.computeLeaseQuorumRound(r.trk.Voters, r.id)
+	if q <= r.readOnly.leader.leaseQuorumRound {
+		return
+	}
+	r.readOnly.leader.leaseQuorumRound = q
+	r.grantProposalsCoveredBy(q)
+}
+
+// grantProposalsCoveredBy grants the leader's pending renewal and every held
+// follower request that was waiting on round or earlier.
+func (r *raft) grantProposalsCoveredBy(round uint64) {
+	if r.readOnly.leader.pendingSelfStart != 0 && r.readOnly.leader.pendingSelfRound <= round {
+		r.readOnly.installPendingSelfLease(r.id, r.raftLog.committed)
+	}
+	if r.readOnly.option != ReadOnlyGrantLeases {
+		return
+	}
+	for _, id := range r.readOnly.leader.parkedGrantIds() {
+		pg := r.readOnly.leader.pendingGrants[id]
+		if pg.needRound > round {
+			continue // arrived after round was sent
+		}
+		r.readOnly.leader.dropPendingGrant(id)
+		// Held a full lease duration: the lease would expire on arrival, so refuse.
+		if r.readOnly.parkedGrantStale(pg) {
+			r.sendReadLeaseResp(id, pg.leaseId, nil)
+			continue
+		}
+		// Only the slot count can have changed while held. The catch-up margin
+		// is deliberately not re-checked: it only filters requests on arrival,
+		// and a follower cannot serve below the lease's LogIndex anyway.
+		pr := r.trk.Progress[id]
+		if pr == nil || !r.readOnly.canGrantLeaseSlot(id) {
+			r.sendReadLeaseResp(id, pg.leaseId, nil)
+			continue
+		}
+		lease := r.readOnly.grantNewLease(id, pg.leaseId, max(pg.askedIndex, pr.Match), r.raftLog.committed)
+		r.sendReadLeaseResp(id, pg.leaseId, lease)
+	}
+}
+
+// sendReadLeaseResp answers a follower's lease request; a nil lease means
+// refused. LogTerm carries the lease id back so the follower can match the
+// answer to its request.
+func (r *raft) sendReadLeaseResp(to uint64, leaseId uint64, lease *ReadLease) {
+	resp := pb.Message{
+		To: to, From: r.id, Type: pb.MsgAskReadLeaseResp,
+		Index: r.raftLog.committed, LogTerm: leaseId,
+		Entries: []pb.Entry{{}},
+	}
+	if lease == nil {
+		resp.Reject = true
+	} else {
+		resp.Entries[0].Data = lease.Marshal()
+	}
+	r.send(resp)
+}
+
 // maybeSendSnapshot fetches a snapshot from Storage, and sends it to the given
 // node. Returns true iff the snapshot message has been emitted successfully.
 func (r *raft) maybeSendSnapshot(to uint64, pr *tracker.Progress) bool {
@@ -750,6 +857,8 @@ func (r *raft) sendHeartbeat(to uint64, ctx []byte) {
 		Type:    pb.MsgHeartbeat,
 		Commit:  commit,
 		Context: ctx,
+		// The current lease round; 0 outside leased modes.
+		Index: r.readOnly.leader.leaseRound,
 	})
 	pr.SentCommit(commit)
 }
@@ -776,6 +885,11 @@ func (r *raft) bcastHeartbeat() {
 }
 
 func (r *raft) bcastHeartbeatWithCtx(ctx []byte) {
+	if r.readOnly.usesReadLeases() {
+		// In leased modes every heartbeat broadcast starts a new lease round.
+		r.readOnly.leader.mintLeaseRound()
+		defer r.advanceLeaseQuorum() // a single voter is its own majority
+	}
 	r.trk.Visit(func(id uint64, _ *tracker.Progress) {
 		if id == r.id {
 			return
@@ -819,73 +933,64 @@ func (r *raft) appliedSnap(snap *pb.Snapshot) {
 	r.appliedTo(index, 0 /* size */)
 }
 
+// askReadLeaseHoldersForAckIndex sends MsgAskAckIndex to every lease holder
+// whose acked index is below cutoffIndex, at most once per
+// _ACK_INDEX_ASK_INTERVAL_MICROS per holder.
 func (r *raft) askReadLeaseHoldersForAckIndex(cutoffIndex uint64) {
-	if r.readOnly.option != ReadOnlyGrantLeases {
-		r.logger.Warning("askReadLeaseHoldersForAckIndex called when not using ReadOnlyGrantLeases")
-		return
-	}
-	toAsk := r.readOnly.getNodesWithAckIndexLessThan(cutoffIndex)
-	if len(toAsk) == 0 {
-		return
-	}
+	r.readOnly.leader.grantedLeases.CleanupExpiredLeases()
 	now := nowMicros()
-	for _, nodeID := range toAsk {
-		rl := r.readOnly.getReadLease(nodeID)
-		if rl == nil {
-			r.logger.Warningf("cannot ask node %x for read lease ack index; no read lease found", nodeID)
-			continue
-		}
+	r.readOnly.leader.grantedLeases.Range(func(id uint64, rl *ReadLease) bool {
 		// Only ask if we haven't asked recently.
-		if rl.LastAckAsked < now && now-rl.LastAckAsked >= _ACK_INDEX_ASK_INTERVAL_MICROS {
+		if rl.AckedIndex < cutoffIndex &&
+			rl.LastAckAsked < now && now-rl.LastAckAsked >= _ACK_INDEX_ASK_INTERVAL_MICROS {
 			r.send(pb.Message{
-				To:   nodeID,
+				To:   id,
 				From: r.id,
 				Type: pb.MsgAskAckIndex,
 			})
-			r.readOnly.markAckAskedForAtTime(nodeID, now)
+			rl.LastAckAsked = now
 		}
-	}
+		return true
+	})
 }
 
-// maybeCommit attempts to advance the commit index. Returns true if the commit
-// index changed (in which case the caller should call r.bcastAppend). This can
-// only be called in StateLeader.
 // newLeaderSafeguardPassed reports whether the new-leader safeguard has lifted,
-// by timer *or* by the confirmation shortcut. This is what callers should use;
-// readOnly.safeguardHasPassed is only the timer half.
+// by timer *or* by the confirmation shortcut. Always true outside leased modes.
 //
 // The shortcut rests on a single fact: any message a peer sends at this node's
 // current term proves the peer already stepped to that term, and stepping a
 // term runs reset(), which rebuilds readOnly and so destroys the peer's lease
-// and its ack index. A peer that has confirmed the current term therefore holds not lease from an
-// earlier term and cannot re-acquire one from an old leader (grants require r.Term == m.Term at a
-// leader, and this leader is not granting yet). Once every node that could be
-// holding a prior-term lease has confirmed it does not, the new leader knows no prior-term leases exist.
+// and its ack index. A peer that has confirmed the current term therefore holds
+// no lease from an earlier term and cannot re-acquire one from an old leader.
+// Once every node that could be holding a prior-term lease has confirmed
+// it does not, the new leader knows no prior-term leases exist.
 //
-// The required set is the current configuration plus any node named by an
-// unapplied conf change (see scanUnappliedConfChanges). Nodes removed from the
-// configuration are not in it and do not need to be: the leader refuses to
-// remove a node while it holds a lease, so a departed node never carries one
-// out with it.
+// The required set is the current configuration, learners included, plus any
+// node named by an unapplied conf change (see scanUnappliedConfChanges). Nodes
+// removed from the configuration are not in it and do not need to be: a leader
+// refuses to remove a node while it holds a granted lease, and a leader being
+// removed itself gives up its own lease first (banSelfLease), so a departed
+// node never carries a lease out with it.
 func (r *raft) newLeaderSafeguardPassed() bool {
-	if r.readOnly.option != ReadOnlyGrantLeases {
+	ro := r.readOnly
+	if !ro.usesReadLeases() || ro.safeguard.hasPassed() {
 		return true
 	}
-	if r.readOnly.safeguardHasPassed() {
-		return true
-	}
-	if r.readOnly.safeguardScanFailed {
+	if ro.safeguard.scanFailed {
 		return false
 	}
 	confirmed := func(id uint64) bool {
-		return id == r.id || r.readOnly.isConfirmedAtTerm(id)
+		return id == r.id || r.readOnly.safeguard.isConfirmedAtTerm(id)
 	}
 	for id := range r.trk.Progress {
+		// Learners too: a previous leader demoting itself is a learner here.
 		if !confirmed(id) {
 			return false
 		}
 	}
-	for id := range r.readOnly.safeguardRequired {
+	// Waited on in both modes: a node removed and re-added in the unapplied log
+	// may be a former voter.
+	for id := range r.readOnly.safeguard.unappliedConfNodes {
 		if !confirmed(id) {
 			return false
 		}
@@ -894,7 +999,7 @@ func (r *raft) newLeaderSafeguardPassed() bool {
 		"hold a prior-term lease has been heard from at term %d", r.id, r.Term)
 	// Latch, so a later configuration change cannot re-close a window that has
 	// already been lifted (and acted upon).
-	r.readOnly.markSafeguardPassed()
+	r.readOnly.safeguard.markPassed()
 	return true
 }
 
@@ -931,7 +1036,10 @@ func confChangeFromEntry(e pb.Entry) (pb.ConfChangeV2, bool) {
 //     removal inherited from a previous leader would otherwise let this leader
 //     grant a lease to a node that is about to leave the configuration, and the
 //     holder keeps serving locally long after switchToConfig evicts the lease
-//     from *this* node's map.
+//     from *this* node's map;
+//   - a removal of this node itself in the tail instead bars it from holding a
+//     self-lease for the term (banSelfLease). So does a failed scan, since it
+//     cannot rule one out.
 //
 // hasPendingConf is not a usable substitute: becomeLeader sets pendingConfIndex
 // to the last index unconditionally, so it reports true whenever any tail
@@ -944,86 +1052,71 @@ func (r *raft) scanUnappliedConfChanges() {
 	}
 	var required, banned []uint64
 	if err := r.raftLog.scan(lo, hi, r.raftLog.maxApplyingEntsSize, func(ents []pb.Entry) error {
-		for _, e := range ents {
-			cc, ok := confChangeFromEntry(e)
-			if !ok {
-				continue
-			}
-			for _, change := range cc.Changes {
-				required = append(required, change.NodeID)
-				if change.Type == pb.ConfChangeRemoveNode {
-					banned = append(banned, change.NodeID)
-				}
-			}
-		}
+		named, removed := confChangeNodes(ents)
+		required = append(required, named...)
+		banned = append(banned, removed...)
 		return nil
 	}); err != nil {
 		// Unexpected: entries above applied are never compacted. Fall back to
 		// the full timer rather than shortcut on a partial set.
 		r.logger.Errorf("%x failed scanning unapplied entries [%d, %d) for conf changes; "+
 			"new-leader safeguard shortcut disabled this term: %v", r.id, lo, hi, err)
-		r.readOnly.markSafeguardScanFailed()
+		r.readOnly.safeguard.scanFailed = true
+		r.readOnly.banSelfLease()
 		return
 	}
 	for _, id := range required {
-		r.readOnly.requireConfirmation(id)
+		r.readOnly.safeguard.unappliedConfNodes[id] = struct{}{}
 	}
 	for _, id := range banned {
-		r.readOnly.banLease(id)
+		if id == r.id {
+			r.readOnly.banSelfLease()
+		} else {
+			r.readOnly.leader.banGrant(id)
+		}
 	}
 }
 
-// removalTargetHoldingLease bans every RemoveNode target in `ents` from being
-// granted a read lease for the rest of this term, and returns the first such
-// target that currently holds an active lease, if any.
-//
-// Only RemoveNode counts. Demoting a voter to a learner is not a departure.
-func (r *raft) removalTargetHoldingLease(ents []pb.Entry) (uint64, bool) {
-	var targets []uint64
+// confChangeNodes returns every node id named by a conf change in ents, and
+// separately the ids those conf changes remove. Demoting a voter to a learner
+// is not a removal.
+func confChangeNodes(ents []pb.Entry) (named, removed []uint64) {
 	for _, e := range ents {
 		cc, ok := confChangeFromEntry(e)
 		if !ok {
 			continue
 		}
 		for _, change := range cc.Changes {
+			named = append(named, change.NodeID)
 			if change.Type == pb.ConfChangeRemoveNode {
-				targets = append(targets, change.NodeID)
+				removed = append(removed, change.NodeID)
 			}
 		}
 	}
-	var holder uint64
-	var found bool
-	for _, id := range targets {
-		r.readOnly.banLease(id)
-		if !found && r.readOnly.hasActiveReadLease(id) {
-			holder, found = id, true
-		}
-	}
-	return holder, found
+	return named, removed
 }
 
+// maybeCommit attempts to advance the commit index. Returns true if the commit
+// index changed (in which case the caller should call r.bcastAppend). This can
+// only be called in StateLeader.
 func (r *raft) maybeCommit() bool {
 	defer traceCommit(r)
 	quorumCommitIndex := r.trk.Committed()
 
-	// A freshly-elected leader commits nothing at all until the safeguard
-	// window has elapsed. It cannot know which leases a prior leader granted,
-	// so it has no clamp protecting their holders; any commit it makes could
-	// expose state a still-live lease holder could then fail to guarantee on a later read. This
-	// blocks the election no-op too, which is necessary: committing the no-op
-	// commits the entire prior-term tail along with it.
-	//
-	// Blocking commits also keeps committedEntryInCurrentTerm() false for the
-	// duration, which in turn suppresses leader read serving and (via the gate
-	// in the MsgAskReadLease handler) new lease grants. This is intentional.
-	if r.readOnly.option == ReadOnlyGrantLeases && !r.newLeaderSafeguardPassed() {
+	// A new leader commits nothing, not even its empty entry (which would also
+	// commit everything left from the previous term), until the new-leader
+	// safeguard lifts: a lease from the previous term, held by a follower or by
+	// the old leader itself, may still be serving reads, and this leader cannot
+	// see it. This also keeps committedEntryInCurrentTerm() false, which holds
+	// leader reads and refuses lease requests until then.
+	if !r.newLeaderSafeguardPassed() {
 		return false
 	}
 
-	if r.readOnly.option == ReadOnlyGrantLeases && r.readOnly.getNumReadLeases() > 0 {
+	if r.readOnly.option == ReadOnlyGrantLeases && r.readOnly.getNumGrantedLeases() > 0 {
 		// With read leases, we can only commit up to the minimum of the
 		// quorum commit index and the lease index.
-		readLeaseAckIndex := r.readOnly.getMinReadLeaseAckedIndex()
+		readLeaseAckIndex := r.readOnly.getMinGrantedAckedIndex()
 		if readLeaseAckIndex == 0 {
 			r.logger.Warningf("cannot advance commit index to %d, min read lease acked index is 0", quorumCommitIndex)
 			r.askReadLeaseHoldersForAckIndex(1)
@@ -1145,10 +1238,8 @@ func (r *raft) tickHeartbeat() {
 		return
 	}
 
-	// GrantLeases: advance the new-leader safeguard by one tick.
-	if r.readOnly.option == ReadOnlyGrantLeases {
-		r.readOnly.tickSafeguard()
-	}
+	// Done before the heartbeat so this heartbeat can grant the renewal.
+	r.maybeRenewSelfLease()
 
 	if r.heartbeatElapsed >= r.heartbeatTimeout {
 		r.heartbeatElapsed = 0
@@ -1156,28 +1247,18 @@ func (r *raft) tickHeartbeat() {
 			r.logger.Debugf("error occurred during checking sending heartbeat: %v", err)
 		}
 	}
+	// Resend an urgent heartbeat for leases if needed
+	r.maybeSendLeaseRound()
 
-	// GrantLeases: retry a commit the safeguard suppressed.
-	//
-	// Commit normally only advances in response to an append response, and raft
-	// never otherwise declines a commit the quorum has already earned, so there
-	// is always a pending event to drive it. The safeguard breaks that: it
-	// refuses commits inside its window, and once those append responses have
-	// been consumed nothing re-drives them. In a group with no write traffic
-	// after an election the no-op would never commit, leaving the leader
-	// permanently unable to serve reads or grant leases.
-	//
-	// committedEntryInCurrentTerm() is exactly "do we still owe the no-op
-	// commit": it goes true the moment that commit lands and stays true for the
-	// rest of the term, so this is unreachable outside of that window.
-	if r.readOnly.option == ReadOnlyGrantLeases &&
+	// Leased modes: retry a commit the safeguard suppressed. Commits are driven
+	// by appends, and appends consumed inside the safeguard window are not
+	// replayed, so an idle group never commits its empty entry and can't
+	// serve reads nor grant leases. Unreachable once an entry is committed in the term.
+	if r.readOnly.usesReadLeases() &&
 		!r.committedEntryInCurrentTerm() &&
 		r.newLeaderSafeguardPassed() &&
 		r.maybeCommit() {
-		// Read-index requests that arrived during the window were parked in
-		// pendingReadIndexMessages; this commit is the first in our term, so
-		// they can now be answered. Without this they would sit there until the
-		// next unrelated commit.
+		// Reads held during the safeguard window can be answered now.
 		releasePendingReadIndexMessages(r)
 		r.bcastAppend()
 	}
@@ -1231,6 +1312,10 @@ func (r *raft) becomeLeader() {
 		panic("invalid transition [follower -> leader]")
 	}
 	r.step = stepLeader
+	// reset clears readOnly, discarding the votes this node collected as a
+	// candidate for this term. Since those votes were for this term,
+	// we can still use them for the safeguard shortcut.
+	candidateConfirmed := r.readOnly.safeguard.confirmedAtTerm
 	r.reset(r.Term)
 	r.tick = r.tickHeartbeat
 	r.lead = r.id
@@ -1252,12 +1337,18 @@ func (r *raft) becomeLeader() {
 	// could be expensive.
 	r.pendingConfIndex = r.raftLog.lastIndex()
 
-	// GrantLeases: arm the two-phase new-leader safeguard and work out which
-	// nodes it must account for. Both must happen before the empty entry is
-	// appended below, since that entry is what the safeguard withholds.
-	if r.readOnly.option == ReadOnlyGrantLeases {
-		r.readOnly.startNewLeaderSafeguard(r.electionTimeout)
+	// Leased modes: start the new-leader safeguard and find the nodes it must
+	// hear from. Both must happen before the empty entry below is appended,
+	// because the safeguard is what stops it committing.
+	if r.readOnly.usesReadLeases() {
+		// One lease duration plus drift: every lease was requested before this
+		// election, so none can outlast that.
+		r.readOnly.safeguard.start(
+			r.readOnly.readLeaseDuration + _SAFEGUARD_CLOCK_DRIFT_MICROS)
 		r.scanUnappliedConfChanges()
+		for id := range candidateConfirmed {
+			r.readOnly.safeguard.confirmAtTerm(id)
+		}
 	}
 
 	traceBecomeLeader(r)
@@ -1481,7 +1572,7 @@ func (r *raft) Step(m pb.Message) error {
 		return nil
 	}
 
-	// GrantLeases: a message from a peer stamped with our current term proves
+	// Leased modes: a message from a peer stamped with our current term proves
 	// that peer has stepped to this term, and stepping a term runs reset(),
 	// which rebuilds readOnly and so destroys any lease the peer held from an
 	// earlier term. Recording that lets the new-leader safeguard lift as soon as
@@ -1494,11 +1585,11 @@ func (r *raft) Step(m pb.Message) error {
 	// carry no evidence about a remote node's term, and pre-vote responses are
 	// stamped with the *candidate's* prospective term rather than the
 	// responder's.
-	if r.readOnly.option == ReadOnlyGrantLeases && m.Term == r.Term && m.From != None && m.From != r.id {
+	if r.readOnly.usesReadLeases() && m.Term == r.Term && m.From != None && m.From != r.id {
 		switch m.Type {
 		case pb.MsgAppResp, pb.MsgHeartbeatResp, pb.MsgVoteResp,
 			pb.MsgAskAckIndexResp, pb.MsgAskReadLease:
-			r.readOnly.confirmAtTerm(m.From)
+			r.readOnly.safeguard.confirmAtTerm(m.From)
 		}
 	}
 
@@ -1621,23 +1712,34 @@ func stepLeader(r *raft, m pb.Message) error {
 			r.logger.Debugf("%x [term %d] transfer leadership to %x is in progress; dropping proposal", r.id, r.Term, r.leadTransferee)
 			return ErrProposalDropped
 		}
-		if r.readOnly.option == ReadOnlyGrantLeases && !r.newLeaderSafeguardPassed() {
+		if !r.newLeaderSafeguardPassed() {
 			r.logger.Debugf("%x [term %d] read-only lease safeguard has not passed; dropping proposal", r.id, r.Term)
 			return ErrProposalDropped
 		}
 
-		// GrantLeases: a node must not leave the configuration while it holds a
-		// read lease. Once removed it is unreachable to the leader, but keeps
-		// serving reads locally until its own clock expires the lease. Bar every
-		// removal target from acquiring one, and refuse the change outright while
-		// a target still holds one. Banning without refusing would let the live
-		// lease out; refusing without banning would never converge, because the
-		// target's next renewal would be granted as normal.
-		if r.readOnly.option == ReadOnlyGrantLeases {
-			if holder, found := r.removalTargetHoldingLease(m.Entries); found {
-				r.logger.Infof("%x refusing conf change: %x still holds a read lease; draining it first",
-					r.id, holder)
-				return ErrProposalDropped
+		if r.readOnly.usesReadLeases() {
+			_, removed := confChangeNodes(m.Entries)
+
+			// GrantLeases: a node must not leave the configuration while it holds a
+			// read lease. Once removed it is unreachable to the leader, but keeps
+			// serving reads locally until its own clock expires the lease. Bar every
+			// removal target from acquiring one, and refuse the change outright while
+			// a target still holds one. Banning without refusing would let the live
+			// lease out; refusing without banning would never converge, because the
+			// target's next renewal would be granted as normal.
+			if r.readOnly.option == ReadOnlyGrantLeases {
+				if holder, found := r.readOnly.banGrants(removed); found {
+					r.logger.Infof("%x refusing conf change: %x still holds a read lease; lease banning it first",
+						r.id, holder)
+					return ErrProposalDropped
+				}
+			}
+
+			// A leader proposing its own removal first lease bans itself, so no node can apply
+			// the removal while the leader holds a lease.
+			if slices.Contains(removed, r.id) {
+				r.logger.Infof("%x proposing its own removal; giving up leader self-lease for term %d", r.id, r.Term)
+				r.readOnly.banSelfLease()
 			}
 		}
 
@@ -1861,7 +1963,7 @@ func stepLeader(r *raft, m pb.Message) error {
 			// would prevent it.
 			if pr.MaybeUpdate(m.Index) || (pr.Match == m.Index && pr.State == tracker.StateProbe) {
 				if r.readOnly.option == ReadOnlyGrantLeases {
-					r.readOnly.markReadLeaseIndex(m.From, m.Index)
+					r.readOnly.updateGrantedAckedIndex(m.From, m.Index)
 				}
 
 				switch {
@@ -1936,7 +2038,18 @@ func stepLeader(r *raft, m pb.Message) error {
 			r.sendAppend(m.From)
 		}
 
-		if r.readOnly.option != ReadOnlySafe || len(m.Context) == 0 {
+		// Index carries the lease round the follower is returning. Record it,
+		// grant whatever a majority now allows, and send another heartbeat if
+		// something still waiting has become urgent.
+		if r.readOnly.usesReadLeases() && m.Index != 0 &&
+			r.readOnly.leader.recordLeaseEcho(m.From, m.Index) {
+			r.advanceLeaseQuorum()
+			r.maybeSendLeaseRound()
+		}
+
+		// A context means a read-index round in any mode, not only ReadOnlySafe:
+		// leased modes fall back to one when the leader has no live lease.
+		if len(m.Context) == 0 {
 			return nil
 		}
 
@@ -1998,7 +2111,17 @@ func stepLeader(r *raft, m pb.Message) error {
 		// Transfer leadership to third party.
 		r.logger.Infof("%x [term %d] starts to transfer leadership to %x", r.id, r.Term, leadTransferee)
 		// Transfer leadership should be finished in one electionTimeout, so reset r.electionElapsed.
+		//
+		// Also clear RecentActive. Resetting only electionElapsed lets replies
+		// from before the transfer count toward the next quorum check, so a
+		// leader cut off after transferring could stay leader for up to
+		// 2*electionTimeout (etcd-io/raft#99).
 		r.electionElapsed = 0
+		r.trk.Visit(func(id uint64, pr *tracker.Progress) {
+			if id != r.id {
+				pr.RecentActive = false
+			}
+		})
 		r.leadTransferee = leadTransferee
 		if pr.Match == r.raftLog.lastIndex() {
 			r.sendTimeoutNow(leadTransferee)
@@ -2008,29 +2131,32 @@ func stepLeader(r *raft, m pb.Message) error {
 		}
 	case pb.MsgAskReadLease:
 		r.logger.Infof("Got MsgAskReadLease from %x at leader (leaseId: %d)", m.From, m.LogTerm)
-		// First, check if we have an active read lease for this node.
-		resp := pb.Message{To: m.From, From: r.id, Type: pb.MsgAskReadLeaseResp,
-			Index: r.raftLog.committed, Entries: []pb.Entry{{}}}
-		// trk.Progress holds learners as well as voters,
-		// but granting leases to learners is intentional.
+		// trk.Progress holds learners as well as voters, but granting leases to
+		// learners is intentional.
 		pr := r.trk.Progress[m.From]
-		// There are six requirements to grant a read lease:
-		if r.readOnly.option == ReadOnlyGrantLeases && // TODO: Maybe log if this specific condition fails?
-			r.Term == m.Term && // 1. The request is for the current term.
-			r.committedEntryInCurrentTerm() && // 2. This leader has committed an entry in its own term.
-			pr != nil && // 3. The asker is still in the current configuration.
-			!r.readOnly.isLeaseBanned(m.From) && // 4. The asker is not being removed from the configuration.
-			r.raftLog.committed <= m.Index+uint64(r.readOnly.leaseCatchupMargin) && // 5. The follower has an up-to-date log.
-			(r.readOnly.getNumReadLeases() < r.readOnly.maxReadLeases || // 6. We have read leases available,
-				r.readOnly.hasActiveReadLease(m.From)) { // OR we already have an active lease for this node.
-			ackIndex := max(m.Index, pr.Match)
-			readLease := r.readOnly.grantNewLease(m.From, m.LogTerm, ackIndex, r.raftLog.committed)
-			resp.Reject = false
-			resp.Entries[0].Data = readLease.Marshal()
-		} else {
-			resp.Reject = true
+		// Requirements 1-6 are checked only here; grantProposalsCoveredBy
+		// re-checks only 6.
+		if r.readOnly.option != ReadOnlyGrantLeases || // TODO: Maybe log if this specific condition fails?
+			r.Term != m.Term || // 1. The request is for the current term.
+			!r.committedEntryInCurrentTerm() || // 2. This leader has committed an entry in its own term.
+			pr == nil || // 3. The asker is still in the current configuration.
+			r.readOnly.leader.isGrantBanned(m.From) || // 4. The asker is not being removed from the configuration.
+			r.raftLog.committed > m.Index+uint64(r.readOnly.leaseCatchupMargin) || // 5. The follower has an up-to-date log.
+			!r.readOnly.canGrantLeaseSlot(m.From) { // 6. A lease slot is free, or this node already holds one.
+			r.sendReadLeaseResp(m.From, m.LogTerm, nil)
+			return nil
 		}
-		r.send(resp)
+		// 7. A majority must return a lease round sent after this request.
+		// Until then the request is held rather than refused.
+		if r.readOnly.parkGrant(m.From, pendingGrant{
+			leaseId: m.LogTerm, proposedAt: nowMicros(), askedIndex: m.Index,
+		}) {
+			r.logger.Debugf("%x parking read lease request from %x (leaseId: %d) pending a quorum round",
+				r.id, m.From, m.LogTerm)
+		}
+		// Also on re-asks, in case the held request has become urgent or its
+		// heartbeat was lost.
+		r.maybeSendLeaseRound()
 	case pb.MsgAskAckIndexResp:
 		if r.readOnly.option != ReadOnlyGrantLeases {
 			r.logger.Warningf("got MsgAskAckIndexResp from %x at leader, but leader not using ReadOnlyGrantLeases",
@@ -2038,14 +2164,14 @@ func stepLeader(r *raft, m pb.Message) error {
 			return nil
 		}
 		r.logger.Infof("got MsgAskAckIndexResp from %x at leader for index %d", m.From, m.Index)
-		rl := r.readOnly.getReadLease(m.From)
+		rl := r.readOnly.getGrantedLease(m.From)
 		if rl == nil {
 			r.logger.Warningf("no read lease found for %x at leader, but got MsgAskAckIndexResp", m.From)
 			return nil
 		}
 		oldIndex := rl.AckedIndex
-		minAckIndex := r.readOnly.getMinReadLeaseAckedIndex()
-		r.readOnly.markReadLeaseIndex(m.From, m.Index)
+		minAckIndex := r.readOnly.getMinGrantedAckedIndex()
+		r.readOnly.updateGrantedAckedIndex(m.From, m.Index)
 		if oldIndex == minAckIndex && r.maybeCommit() {
 			releasePendingReadIndexMessages(r)
 			r.bcastAppend()
@@ -2133,7 +2259,7 @@ func stepFollower(r *raft, m pb.Message) error {
 		m.To = r.lead
 		r.send(m)
 	case pb.MsgForgetLeader:
-		if r.readOnly.option == ReadOnlyLeaseBased || r.readOnly.option == ReadOnlyGrantLeases {
+		if r.readOnly.usesReadLeases() {
 			r.logger.Error("ignoring MsgForgetLeader due to ReadOnlyLeaseBased or ReadOnlyGrantLeases")
 			return nil
 		}
@@ -2153,14 +2279,12 @@ func stepFollower(r *raft, m pb.Message) error {
 			return nil
 		}
 		if r.readOnly.option == ReadOnlyGrantLeases {
-			rl := r.readOnly.getReadLease(r.id)
-			untilExpired := r.readOnly.microsUntilLeaseExpired(r.id)
+			rl := r.readOnly.getHeldLease() // nil if expired
 			// readLeaseAckedIndex, not rl.AckedIndex: the lease's copy is only as
 			// fresh as the grant that installed it, while this is every ack we
 			// have made, including those made with no lease installed.
 			ackedIndex := r.readOnly.readLeaseAckedIndex
 			if rl != nil &&
-				untilExpired > 0 && // Check that the lease is still valid
 				rl.LogIndex <= r.raftLog.committed { // This enforces catchup margins
 				if (ackedIndex <= r.raftLog.committed && // This enforces that this node has anything it's acked
 					// Experimental feature: Commit is an additional index this node
@@ -2213,7 +2337,9 @@ func stepFollower(r *raft, m pb.Message) error {
 			return nil
 		}
 		if m.Reject {
-			r.logger.Infof("%x's request for read lease was rejected by leader %x", r.id, m.From)
+			// Forget the refused lease id, which LogTerm carries back.
+			r.readOnly.clearPendingLease(m.LogTerm)
+			r.logger.Infof("%x's request for read lease was rejected by leader %x (leaseId: %d)", r.id, m.From, m.LogTerm)
 			return nil
 		}
 
@@ -2235,15 +2361,15 @@ func stepFollower(r *raft, m pb.Message) error {
 		}
 	case pb.MsgAskAckIndex:
 		if r.readOnly.option != ReadOnlyGrantLeases {
-			r.logger.Warningf("%x received unexpected MsgAskAckIndex from %x", r.id, m.From, r.readOnly.option)
+			r.logger.Warningf("%x received unexpected MsgAskAckIndex from %x (read-only option %d)", r.id, m.From, r.readOnly.option)
 			return nil
 		}
 		resp := pb.Message{To: m.From, From: r.id, Type: pb.MsgAskAckIndexResp, Index: 0}
-		if r.readOnly.hasActiveReadLease(r.id) {
+		if r.readOnly.hasActiveHeldLease() {
 			// Load-bearing: the mark is the promise. We must record what we are
 			// about to report before reporting it, so that no later grant can
 			// install an ack index below what the leader is now relying on.
-			r.readOnly.markReadLeaseIndex(r.id, r.raftLog.lastIndex())
+			r.readOnly.markSelfAckedIndex(r.raftLog.lastIndex())
 			resp.Index = r.readOnly.readLeaseAckedIndex
 		}
 		r.send(resp)
@@ -2269,12 +2395,12 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 
 	if a.prev.index < r.raftLog.committed {
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
-		r.readOnly.markReadLeaseIndex(r.id, r.raftLog.committed)
+		r.readOnly.markSelfAckedIndex(r.raftLog.committed)
 		return
 	}
 	if mlastIndex, ok := r.raftLog.maybeAppend(a, m.Commit); ok {
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
-		r.readOnly.markReadLeaseIndex(r.id, mlastIndex)
+		r.readOnly.markSelfAckedIndex(mlastIndex)
 		toFire := r.readIndexDelayer.fireDelayedReadIndexRequests(r.raftLog.committed)
 		for _, next := range toFire {
 			r.Step(next)
@@ -2319,14 +2445,14 @@ func (r *raft) maybeAskForReadLease() {
 	if r.readOnly.option != ReadOnlyGrantLeases || r.lead == None {
 		return
 	}
-	untilExpired := r.readOnly.microsUntilLeaseExpired(r.id)
+	untilExpired := r.readOnly.microsUntilHeldLeaseExpired()
 	if untilExpired < _LEASE_RENEWAL_THRESHOLD_MICROS && r.readOnly.canAskForLease() {
 		lreq := pb.Message{From: r.id, To: r.lead, Index: r.raftLog.committed,
 			LogTerm: r.readOnly.getMarkedLeaseId(),
 			Type:    pb.MsgAskReadLease}
 		r.send(lreq)
 		r.logger.Infof("%x sending MsgAskReadLease to leader %x (leaseId: %d)", r.id, r.lead, lreq.LogTerm)
-		r.readOnly.markAskedForLease()
+		r.readOnly.lastLeaseAskedTime = nowMicros()
 	}
 }
 
@@ -2334,14 +2460,15 @@ func (r *raft) handleHeartbeat(m pb.Message) {
 	r.raftLog.commitTo(m.Commit)
 
 	if r.readOnly.option == ReadOnlyGrantLeases {
-		r.readOnly.markReadLeaseIndex(r.id, r.raftLog.committed)
+		r.readOnly.markSelfAckedIndex(r.raftLog.committed)
 		toFire := r.readIndexDelayer.fireDelayedReadIndexRequests(r.raftLog.committed)
 		for _, next := range toFire {
 			r.Step(next)
 		}
 		r.maybeAskForReadLease()
 	}
-	r.send(pb.Message{To: m.From, Type: pb.MsgHeartbeatResp, Context: m.Context})
+	// Return the leader's lease round in Index (0 outside leased modes).
+	r.send(pb.Message{To: m.From, Type: pb.MsgHeartbeatResp, Context: m.Context, Index: m.Index})
 }
 
 func (r *raft) handleSnapshot(m pb.Message) {
@@ -2356,7 +2483,7 @@ func (r *raft) handleSnapshot(m pb.Message) {
 		r.logger.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, sindex, sterm)
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex()})
-		r.readOnly.markReadLeaseIndex(r.id, r.raftLog.lastIndex())
+		r.readOnly.markSelfAckedIndex(r.raftLog.lastIndex())
 		toFire := r.readIndexDelayer.fireDelayedReadIndexRequests(r.raftLog.committed)
 		for _, next := range toFire {
 			r.Step(next)
@@ -2365,7 +2492,7 @@ func (r *raft) handleSnapshot(m pb.Message) {
 		r.logger.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, sindex, sterm)
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
-		r.readOnly.markReadLeaseIndex(r.id, r.raftLog.committed)
+		r.readOnly.markSelfAckedIndex(r.raftLog.committed)
 	}
 }
 
@@ -2494,10 +2621,14 @@ func (r *raft) switchToConfig(cfg tracker.Config, trk tracker.ProgressMap) pb.Co
 	traceConfChangeEvent(cfg, r)
 
 	if r.readOnly.option == ReadOnlyGrantLeases {
-		// Remove read leases for nodes that are no longer part of the cluster.
+		// Drop the leases and held requests of nodes no longer in the
+		// configuration. banGrant usually drops the request when the removal is
+		// proposed; this covers conf changes that did not pass through this
+		// leader's MsgProp.
 		for id := range r.trk.Progress {
 			if _, ok := trk[id]; !ok {
-				r.readOnly.removeReadLease(id)
+				r.readOnly.leader.grantedLeases.Delete(id)
+				r.readOnly.leader.dropPendingGrant(id)
 			}
 		}
 	}
@@ -2670,20 +2801,25 @@ func sendMsgReadIndexResponse(r *raft, m pb.Message) {
 	// thinking: use an internally defined context instead of the user given context.
 	// We can express this in terms of the term and index instead of a user-supplied value.
 	// This would allow multiple reads to piggyback on the same message.
-	switch r.readOnly.option {
-	// If more than the local vote is needed, go through a full broadcast.
-	case ReadOnlySafe:
-		r.readOnly.addRequest(r.raftLog.committed, m)
-		// The local node automatically acks the request.
-		r.readOnly.recvAck(r.id, m.Entries[0].Data)
-		r.bcastHeartbeatWithCtx(m.Entries[0].Data)
-	case ReadOnlyLeaseBased:
-		if resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.To != None {
-			r.send(resp)
+	if r.readOnly.usesReadLeases() {
+		// Leased modes: answer locally if the leader's own lease is live.
+		r.maybeRenewSelfLease()
+		if r.readOnly.hasActiveHeldLease() {
+			if resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.To != None {
+				r.send(resp)
+			}
+			r.maybeSendLeaseRound()
+			return
 		}
-	case ReadOnlyGrantLeases:
-		if resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.To != None {
-			r.send(resp)
-		}
+		// No live lease: confirm leadership with a read-index heartbeat instead.
+		// That heartbeat also starts a lease round, which the renewal requested
+		// above can use.
+		r.logger.Debugf("%x no active self-lease; serving read index via a quorum round", r.id)
 	}
+
+	// If more than the local vote is needed, go through a full broadcast.
+	r.readOnly.addRequest(r.raftLog.committed, m)
+	// The local node automatically acks the request.
+	r.readOnly.recvAck(r.id, m.Entries[0].Data)
+	r.bcastHeartbeatWithCtx(m.Entries[0].Data)
 }
