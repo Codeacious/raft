@@ -18,6 +18,7 @@ import (
 	"container/heap"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -334,6 +335,9 @@ type readOnly struct {
 	pendingLeases      map[uint64]uint64
 	nextLeaseId        uint64
 	lastLeaseAskedTime uint64
+	// incarnation is the random upper half of every lease id this instance
+	// mints; see incarnationID.
+	incarnation uint64
 
 	// leader is the lease state only a leader uses.
 	leader leaderLeaseState
@@ -412,12 +416,14 @@ type newLeaderSafeguard struct {
 
 func newReadOnly(option ReadOnlyOption, duration uint64,
 	maxleases int, askforlease bool, catchupmargin int) *readOnly {
+	seed := newLeaseIdSeed()
 	return &readOnly{
 		option:           option,
 		pendingReadIndex: make(map[string]*readIndexStatus),
 		creationTime:     nowMicros(),
 		pendingLeases:    make(map[uint64]uint64),
-		nextLeaseId:      newLeaseIdSeed(),
+		nextLeaseId:      seed,
+		incarnation:      leaseIncarnation(seed),
 		leader: leaderLeaseState{
 			followerEchoedRounds: make(map[uint64]uint64),
 			grantedLeases:        newReadLeaseMap(),
@@ -436,11 +442,28 @@ func newReadOnly(option ReadOnlyOption, duration uint64,
 }
 
 // getMarkedLeaseId mints a new lease id and records it as asked for now.
+// The counter wraps within the lower 32 bits so every id keeps this
+// instance's incarnation.
 func (ro *readOnly) getMarkedLeaseId() uint64 {
 	nid := ro.nextLeaseId
-	ro.nextLeaseId++
+	ro.nextLeaseId = ro.incarnation<<32 | (nid+1)&math.MaxUint32
 	ro.pendingLeases[nid] = nowMicros()
 	return nid
+}
+
+// leaseIncarnation returns the incarnation ID a lease id was minted under.
+func leaseIncarnation(leaseId uint64) uint64 {
+	return leaseId >> 32
+}
+
+// incarnationID identifies this readOnly instance, and with it the lifetime
+// of its promise (readLeaseAckedIndex). Every reset() builds a new instance
+// with a zero promise and a fresh random incarnation, so an ack is only as
+// good as the incarnation that sent it. A holder carries it on its acks, and
+// the leader credits an ack to a grant only if the same incarnation asked for
+// that grant (see ackMatchesGrant).
+func (ro *readOnly) incarnationID() uint64 {
+	return ro.incarnation
 }
 
 // usesReadLeases indicates whether reads may be served locally under a lease.
@@ -748,6 +771,20 @@ func (ro *readOnly) activeReadLeaseHolders() []uint64 {
 	return ids
 }
 
+// grantAckedIndex is the AckedIndex a new grant to follower id starts from.
+// A grant's AckedIndex only rises from what its own incarnation reported (its
+// ask, its acks, its MsgAskAckIndexResp) or from switch credits. Match is not
+// used: an ack from an earlier incarnation still advances it (SAFE-2). A
+// renewal from the same incarnation carries the current grant's AckedIndex
+// forward, because the leader's clamp switches to the new grant before the
+// holder stops serving under the current one.
+func (ro *readOnly) grantAckedIndex(id uint64, leaseId uint64, askedIndex uint64) uint64 {
+	if cur := ro.getGrantedLease(id); cur != nil && leaseIncarnation(cur.LeaseId) == leaseIncarnation(leaseId) {
+		return max(askedIndex, cur.AckedIndex)
+	}
+	return askedIndex
+}
+
 func (ro *readOnly) grantNewLease(nodeId uint64, leaseId uint64,
 	ackedIndex uint64, logIndex uint64) *ReadLease {
 	if ro.option != ReadOnlyGrantLeases {
@@ -827,6 +864,16 @@ func (ro *readOnly) updateGrantedAckedIndex(id uint64, index uint64) {
 		return
 	}
 	ro.leader.grantedLeases.UpdateAckedIndex(id, index)
+}
+
+// ackMatchesGrant reports whether an ack follower id sent from the given
+// incarnation may raise its grant's AckedIndex. Only the incarnation that
+// asked for the grant holds the promise the ack reports: an ack from an
+// earlier incarnation, delivered after a restart or same-term reset, would
+// lift the clamp past what the current incarnation promised.
+func (ro *readOnly) ackMatchesGrant(id uint64, incarnation uint64) bool {
+	rl := ro.getGrantedLease(id)
+	return rl != nil && leaseIncarnation(rl.LeaseId) == incarnation
 }
 
 func (ro *readOnly) getMinGrantedAckedIndex() uint64 {

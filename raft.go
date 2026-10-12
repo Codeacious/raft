@@ -791,7 +791,8 @@ func (r *raft) grantProposalsCoveredBy(round uint64) {
 			r.sendReadLeaseResp(id, pg.leaseId, nil)
 			continue
 		}
-		lease := r.readOnly.grantNewLease(id, pg.leaseId, max(pg.askedIndex, pr.Match), r.raftLog.committed)
+		lease := r.readOnly.grantNewLease(id, pg.leaseId,
+			r.readOnly.grantAckedIndex(id, pg.leaseId, pg.askedIndex), r.raftLog.committed)
 		r.sendReadLeaseResp(id, pg.leaseId, lease)
 	}
 }
@@ -1962,7 +1963,9 @@ func stepLeader(r *raft, m pb.Message) error {
 			// back to replicating state is not useful; besides pr.PendingSnapshot
 			// would prevent it.
 			if pr.MaybeUpdate(m.Index) || (pr.Match == m.Index && pr.State == tracker.StateProbe) {
-				if r.readOnly.option == ReadOnlyGrantLeases {
+				// Match advances from any ack; the grant's AckedIndex only from
+				// the incarnation that asked for it (LogTerm, see sendAppResp).
+				if r.readOnly.option == ReadOnlyGrantLeases && r.readOnly.ackMatchesGrant(m.From, m.LogTerm) {
 					r.readOnly.updateGrantedAckedIndex(m.From, m.Index)
 				}
 
@@ -2169,6 +2172,14 @@ func stepLeader(r *raft, m pb.Message) error {
 			r.logger.Warningf("no read lease found for %x at leader, but got MsgAskAckIndexResp", m.From)
 			return nil
 		}
+		// Term 0 is a switch credit injected by the application, which vouches
+		// for the holder's reads whatever its incarnation. A holder's own
+		// answer counts only from the incarnation that asked for this grant.
+		if m.Term != 0 && !r.readOnly.ackMatchesGrant(m.From, m.LogTerm) {
+			r.logger.Infof("ignoring MsgAskAckIndexResp from %x: incarnation %x did not ask for its grant",
+				m.From, m.LogTerm)
+			return nil
+		}
 		oldIndex := rl.AckedIndex
 		minAckIndex := r.readOnly.getMinGrantedAckedIndex()
 		r.readOnly.updateGrantedAckedIndex(m.From, m.Index)
@@ -2279,6 +2290,14 @@ func stepFollower(r *raft, m pb.Message) error {
 			return nil
 		}
 		if r.readOnly.option == ReadOnlyGrantLeases {
+			// A switch hint only covers this term if this term's leader wrote the
+			// register it came from: after a switch reboot, a deposed leader's
+			// lower write can land first (SAFE-1). The switch carries the term in
+			// 32 bits. Any other hint is unusable, so make it unreachable, which
+			// forwards the read.
+			if m.Commit != 0 && uint32(m.LogTerm) != uint32(r.Term) {
+				m.Commit = math.MaxUint64
+			}
 			rl := r.readOnly.getHeldLease() // nil if expired
 			// readLeaseAckedIndex, not rl.AckedIndex: the lease's copy is only as
 			// fresh as the grant that installed it, while this is every ack we
@@ -2364,7 +2383,8 @@ func stepFollower(r *raft, m pb.Message) error {
 			r.logger.Warningf("%x received unexpected MsgAskAckIndex from %x (read-only option %d)", r.id, m.From, r.readOnly.option)
 			return nil
 		}
-		resp := pb.Message{To: m.From, From: r.id, Type: pb.MsgAskAckIndexResp, Index: 0}
+		resp := pb.Message{To: m.From, From: r.id, Type: pb.MsgAskAckIndexResp, Index: 0,
+			LogTerm: r.readOnly.incarnationID()}
 		if r.readOnly.hasActiveHeldLease() {
 			// Load-bearing: the mark is the promise. We must record what we are
 			// about to report before reporting it, so that no later grant can
@@ -2388,18 +2408,30 @@ func logSliceFromMsgApp(m *pb.Message) logSlice {
 	}
 }
 
+// sendAppResp acks an append or snapshot up to index. Under
+// ReadOnlyGrantLeases it carries this node's read-lease incarnation in
+// LogTerm, which a successful MsgAppResp otherwise leaves unused, so the
+// leader can tell which incarnation's promise the ack reports.
+func (r *raft) sendAppResp(to uint64, index uint64) {
+	m := pb.Message{To: to, Type: pb.MsgAppResp, Index: index}
+	if r.readOnly.option == ReadOnlyGrantLeases {
+		m.LogTerm = r.readOnly.incarnationID()
+	}
+	r.send(m)
+}
+
 func (r *raft) handleAppendEntries(m pb.Message) {
 	// TODO(pav-kv): construct logSlice up the stack next to receiving the
 	// message, and validate it before taking any action (e.g. bumping term).
 	a := logSliceFromMsgApp(&m)
 
 	if a.prev.index < r.raftLog.committed {
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
+		r.sendAppResp(m.From, r.raftLog.committed)
 		r.readOnly.markSelfAckedIndex(r.raftLog.committed)
 		return
 	}
 	if mlastIndex, ok := r.raftLog.maybeAppend(a, m.Commit); ok {
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
+		r.sendAppResp(m.From, mlastIndex)
 		r.readOnly.markSelfAckedIndex(mlastIndex)
 		toFire := r.readIndexDelayer.fireDelayedReadIndexRequests(r.raftLog.committed)
 		for _, next := range toFire {
@@ -2482,7 +2514,7 @@ func (r *raft) handleSnapshot(m pb.Message) {
 	if r.restore(s) {
 		r.logger.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, sindex, sterm)
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex()})
+		r.sendAppResp(m.From, r.raftLog.lastIndex())
 		r.readOnly.markSelfAckedIndex(r.raftLog.lastIndex())
 		toFire := r.readIndexDelayer.fireDelayedReadIndexRequests(r.raftLog.committed)
 		for _, next := range toFire {
@@ -2491,7 +2523,7 @@ func (r *raft) handleSnapshot(m pb.Message) {
 	} else {
 		r.logger.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, sindex, sterm)
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
+		r.sendAppResp(m.From, r.raftLog.committed)
 		r.readOnly.markSelfAckedIndex(r.raftLog.committed)
 	}
 }

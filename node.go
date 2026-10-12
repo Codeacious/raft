@@ -223,8 +223,11 @@ type Node interface {
 	// to ensure read index retries.
 	ReadIndex(ctx context.Context, rctx []byte) error
 	// Duplicate function for giving a read lease holder the ack index saved on its ToR switch.
-	// Passing 0 will mean switchIndex is ignored.
-	ReadIndexSwitchHint(ctx context.Context, rctx []byte, switchIndex uint64) error
+	// Passing 0 will mean switchIndex is ignored. switchTerm is the term the switch
+	// stamped with the index; a nonzero switchIndex is only used while it matches
+	// this node's term (modulo 2^32, the width the switch carries), and the read is
+	// forwarded otherwise.
+	ReadIndexSwitchHint(ctx context.Context, rctx []byte, switchIndex uint64, switchTerm uint64) error
 	// Returns true if this node is configured to ask for read leases.
 	IsAskingForReadLease() bool
 
@@ -616,8 +619,9 @@ func (n *node) ReadIndex(ctx context.Context, rctx []byte) error {
 	return n.step(ctx, pb.Message{Type: pb.MsgReadIndex, Entries: []pb.Entry{{Data: rctx}}})
 }
 
-func (n *node) ReadIndexSwitchHint(ctx context.Context, rctx []byte, switchIndex uint64) error {
-	return n.step(ctx, pb.Message{Type: pb.MsgReadIndex, Commit: switchIndex, Entries: []pb.Entry{{Data: rctx}}})
+func (n *node) ReadIndexSwitchHint(ctx context.Context, rctx []byte, switchIndex uint64, switchTerm uint64) error {
+	return n.step(ctx, pb.Message{Type: pb.MsgReadIndex, Commit: switchIndex, LogTerm: switchTerm,
+		Entries: []pb.Entry{{Data: rctx}}})
 }
 
 func (n *node) IsAskingForReadLease() bool {

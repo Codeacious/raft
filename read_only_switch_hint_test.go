@@ -70,11 +70,17 @@ func newSwitchHintTestRaft(t *testing.T, ackedIndex uint64) *raft {
 
 func stepSwitchHintRead(t *testing.T, r *raft, hint uint64) {
 	t.Helper()
+	stepSwitchHintReadAtTerm(t, r, hint, r.Term)
+}
+
+func stepSwitchHintReadAtTerm(t *testing.T, r *raft, hint uint64, hintTerm uint64) {
+	t.Helper()
 	if err := r.Step(pb.Message{
 		From:    2,
 		To:      1,
 		Type:    pb.MsgReadIndex,
 		Commit:  hint,
+		LogTerm: hintTerm,
 		Entries: []pb.Entry{{Data: []byte("ctx")}},
 	}); err != nil {
 		t.Fatalf("step MsgReadIndex: %v", err)
@@ -147,6 +153,40 @@ func TestSwitchHintGate(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("got %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSwitchHintTermGate: a hint counts only in the term whose leader wrote
+// the switch register it came from (SAFE-1). A hint from any other term is
+// treated as unreachable and forwarded, even one that would otherwise be
+// served. The term is compared modulo 2^32, the width the switch carries.
+func TestSwitchHintTermGate(t *testing.T) {
+	tests := []struct {
+		name     string
+		hint     uint64
+		hintTerm func(r *raft) uint64
+		served   bool
+	}{
+		{"hint at this term", 5, func(r *raft) uint64 { return r.Term }, true},
+		{"hint at this term mod 2^32", 5, func(r *raft) uint64 { return r.Term + 1<<32 }, true},
+		{"hint from an earlier term", 5, func(r *raft) uint64 { return r.Term - 1 }, false},
+		{"hint from a later term", 5, func(r *raft) uint64 { return r.Term + 1 }, false},
+		{"no hint ignores the term", 0, func(r *raft) uint64 { return r.Term + 1 }, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newSwitchHintTestRaft(t, 5)
+			stepSwitchHintReadAtTerm(t, r, tt.hint, tt.hintTerm(r))
+			msgs := r.readMessages()
+			if len(msgs) != 1 {
+				t.Fatalf("expected one message, got %+v (%d held)", msgs, r.readIndexDelayer.heldCount())
+			}
+			served := msgs[0].Type == pb.MsgReadIndexResp
+			forwarded := msgs[0].Type == pb.MsgReadIndex && msgs[0].To == r.lead
+			if tt.served && !served || !tt.served && !forwarded {
+				t.Fatalf("served=%v forwarded=%v, want served=%v", served, forwarded, tt.served)
 			}
 		})
 	}

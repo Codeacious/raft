@@ -74,7 +74,7 @@ func (a *rawNodeAdapter) ProposeConfChange(_ context.Context, cc pb.ConfChangeI)
 	return a.RawNode.ProposeConfChange(cc)
 }
 func (a *rawNodeAdapter) IsAskingForReadLease() bool { return false }
-func (a *rawNodeAdapter) ReadIndexSwitchHint(_ context.Context, rctx []byte, switchIndex uint64) error {
+func (a *rawNodeAdapter) ReadIndexSwitchHint(_ context.Context, rctx []byte, switchIndex uint64, switchTerm uint64) error {
 	return nil
 }
 
