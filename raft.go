@@ -431,6 +431,17 @@ type raft struct {
 	// be proposed if the leader's applied index is greater than this
 	// value.
 	pendingConfIndex uint64
+	// confHandedOut counts the conf-change entries handed to the application in
+	// a Ready, and confApplied the ApplyConfChange calls the application has
+	// made. They differ while trk.Config lags the entries raft has handed out:
+	// applied can pass a conf change before the application applies it (an
+	// etcd leader advances first). Leased modes read them in
+	// membershipSettled. They survive reset(), and start at 0 on a restart,
+	// whose Config.Applied is the application's own. A snapshot restore leaves
+	// them alone: the application still applies every conf change it was
+	// handed, and until it does, leases stay paused (fails safe).
+	confHandedOut uint64
+	confApplied   uint64
 	// disableConfChangeValidation is Config.DisableConfChangeValidation,
 	// see there for details.
 	disableConfChangeValidation bool
@@ -725,6 +736,9 @@ func (r *raft) maybeRenewSelfLease() {
 	if r.readOnly.leader.selfLeaseBanned {
 		return // this leader is being removed; see banSelfLease
 	}
+	if !r.selfLeaseAllowed() {
+		return
+	}
 	if armed := r.readOnly.leader.pendingSelfStart; armed != 0 &&
 		nowMicros()-armed <= r.readOnly.readLeaseDuration {
 		return // renewal already pending, and not yet stale
@@ -739,7 +753,7 @@ func (r *raft) maybeRenewSelfLease() {
 // presumed lost.
 func (r *raft) maybeSendLeaseRound() {
 	if !r.readOnly.usesReadLeases() || r.state != StateLeader ||
-		!r.readOnly.leaseProposalUrgent() {
+		!r.readOnly.leaseProposalUrgent(r.membershipSettled()) {
 		return
 	}
 	if r.readOnly.leader.leaseRoundInFlight() &&
@@ -767,9 +781,18 @@ func (r *raft) advanceLeaseQuorum() {
 // follower request that was waiting on round or earlier.
 func (r *raft) grantProposalsCoveredBy(round uint64) {
 	if r.readOnly.leader.pendingSelfStart != 0 && r.readOnly.leader.pendingSelfRound <= round {
-		r.readOnly.installPendingSelfLease(r.id, r.raftLog.committed)
+		if r.selfLeaseAllowed() {
+			r.readOnly.installPendingSelfLease(r.id, r.raftLog.committed)
+		} else {
+			r.readOnly.dropSelfLease()
+		}
 	}
 	if r.readOnly.option != ReadOnlyGrantLeases {
+		return
+	}
+	// Held requests wait out an unsettled membership instead of being refused;
+	// a later round installs them once it settles.
+	if !r.membershipSettled() {
 		return
 	}
 	for _, id := range r.readOnly.leader.parkedGrantIds() {
@@ -977,21 +1000,16 @@ func (r *raft) newLeaderSafeguardPassed() bool {
 	if !ro.usesReadLeases() || ro.safeguard.hasPassed() {
 		return true
 	}
-	if ro.safeguard.scanFailed {
+	if ro.safeguard.noShortcut {
 		return false
 	}
 	confirmed := func(id uint64) bool {
 		return id == r.id || r.readOnly.safeguard.isConfirmedAtTerm(id)
 	}
+	// Settled at election, so trk.Progress is every node that could hold a
+	// prior-term lease. Learners too: a previous leader demoting itself is a
+	// learner here.
 	for id := range r.trk.Progress {
-		// Learners too: a previous leader demoting itself is a learner here.
-		if !confirmed(id) {
-			return false
-		}
-	}
-	// Waited on in both modes: a node removed and re-added in the unapplied log
-	// may be a former voter.
-	for id := range r.readOnly.safeguard.unappliedConfNodes {
 		if !confirmed(id) {
 			return false
 		}
@@ -1025,76 +1043,80 @@ func confChangeFromEntry(e pb.Entry) (pb.ConfChangeV2, bool) {
 	}
 }
 
-// scanUnappliedConfChanges scans the unapplied log tail for configuration
-// changes, seeding the two sets the new-leader safeguard depends on. Called
-// once, from becomeLeader.
-//
-//   - every node id a conf change names becomes an extra confirmation the
-//     shortcut must collect: an *addition* that has not applied yet leaves its
-//     node absent from trk.Progress, and that node may still hold a lease from
-//     the previous leader;
-//   - every RemoveNode target is barred from being granted a lease, since a
-//     removal inherited from a previous leader would otherwise let this leader
-//     grant a lease to a node that is about to leave the configuration, and the
-//     holder keeps serving locally long after switchToConfig evicts the lease
-//     from *this* node's map;
-//   - a removal of this node itself in the tail instead bars it from holding a
-//     self-lease for the term (banSelfLease). So does a failed scan, since it
-//     cannot rule one out.
-//
-// hasPendingConf is not a usable substitute: becomeLeader sets pendingConfIndex
-// to the last index unconditionally, so it reports true whenever any tail
-// exists- and under the safeguard `applied` cannot advance, so it would never
-// clear and the shortcut would never fire.
-func (r *raft) scanUnappliedConfChanges() {
-	lo, hi := r.raftLog.applied+1, r.raftLog.lastIndex()+1
-	if lo >= hi {
-		return
-	}
-	var required, banned []uint64
-	if err := r.raftLog.scan(lo, hi, r.raftLog.maxApplyingEntsSize, func(ents []pb.Entry) error {
-		named, removed := confChangeNodes(ents)
-		required = append(required, named...)
-		banned = append(banned, removed...)
-		return nil
-	}); err != nil {
-		// Unexpected: entries above applied are never compacted. Fall back to
-		// the full timer rather than shortcut on a partial set.
-		r.logger.Errorf("%x failed scanning unapplied entries [%d, %d) for conf changes; "+
-			"new-leader safeguard shortcut disabled this term: %v", r.id, lo, hi, err)
-		r.readOnly.safeguard.scanFailed = true
-		r.readOnly.banSelfLease()
-		return
-	}
-	for _, id := range required {
-		r.readOnly.safeguard.unappliedConfNodes[id] = struct{}{}
-	}
-	for _, id := range banned {
-		if id == r.id {
-			r.readOnly.banSelfLease()
-		} else {
-			r.readOnly.leader.banGrant(id)
-		}
-	}
+// membershipSettled reports whether this leader's membership is settled: every
+// conf change in its log has been applied to trk.Config, and the config is not
+// joint. Leases are granted, installed and held only while it is (see the
+// settled-membership design note in RAFT.md). A new leader is unsettled until it
+// has applied its inherited tail (becomeLeader sets pendingConfIndex to the
+// last index), and a leader is unsettled from appending a conf change until the
+// application has applied it. Reads no entries.
+func (r *raft) membershipSettled() bool {
+	return r.raftLog.applied >= r.pendingConfIndex &&
+		r.confHandedOut == r.confApplied &&
+		len(r.trk.Config.Voters[1]) == 0
 }
 
-// confChangeNodes returns every node id named by a conf change in ents, and
-// separately the ids those conf changes remove. Demoting a voter to a learner
-// is not a removal.
-func confChangeNodes(ents []pb.Entry) (named, removed []uint64) {
+// selfLeaseAllowed reports whether this leader may hold its own lease: only
+// while its membership is settled, and only as a member. A leader removed from
+// the configuration keeps leading without stepDownOnRemoval, and no successor
+// waits for a node outside its configuration.
+func (r *raft) selfLeaseAllowed() bool {
+	_, member := r.trk.Progress[r.id]
+	return member && r.membershipSettled()
+}
+
+// settledAtElection reports whether trk.Progress is, at election, every node
+// that could hold a prior-term lease, so the new-leader safeguard may take its
+// shortcut. That needs no conf change in flight: none handed out but not yet
+// applied, no joint config, and none in the unapplied log tail. Called once,
+// from becomeLeader.
+//
+// membershipSettled is not a usable substitute: becomeLeader sets
+// pendingConfIndex to the last index unconditionally, so it is false whenever
+// any tail exists- and under the safeguard applied cannot advance, so the
+// shortcut would never fire.
+func (r *raft) settledAtElection() bool {
+	if r.confHandedOut != r.confApplied || len(r.trk.Config.Voters[1]) > 0 {
+		return false
+	}
+	lo, hi := r.raftLog.applied+1, r.raftLog.lastIndex()+1
+	if lo >= hi {
+		return true
+	}
+	found := false
+	if err := r.raftLog.scan(lo, hi, r.raftLog.maxApplyingEntsSize, func(ents []pb.Entry) error {
+		for _, e := range ents {
+			if e.Type == pb.EntryConfChange || e.Type == pb.EntryConfChangeV2 {
+				found = true
+				return errBreak
+			}
+		}
+		return nil
+	}); err != nil && err != errBreak {
+		// Unexpected: entries above applied are never compacted. A tail that
+		// cannot be read may hold a conf change.
+		r.logger.Errorf("%x failed scanning unapplied entries [%d, %d) for conf changes; "+
+			"new-leader safeguard shortcut disabled this term: %v", r.id, lo, hi, err)
+		return false
+	}
+	return !found
+}
+
+// confChangeRemovals returns the ids that the conf changes in ents remove.
+// Demoting a voter to a learner is not a removal.
+func confChangeRemovals(ents []pb.Entry) (removed []uint64) {
 	for _, e := range ents {
 		cc, ok := confChangeFromEntry(e)
 		if !ok {
 			continue
 		}
 		for _, change := range cc.Changes {
-			named = append(named, change.NodeID)
 			if change.Type == pb.ConfChangeRemoveNode {
 				removed = append(removed, change.NodeID)
 			}
 		}
 	}
-	return named, removed
+	return removed
 }
 
 // maybeCommit attempts to advance the commit index. Returns true if the commit
@@ -1338,15 +1360,15 @@ func (r *raft) becomeLeader() {
 	// could be expensive.
 	r.pendingConfIndex = r.raftLog.lastIndex()
 
-	// Leased modes: start the new-leader safeguard and find the nodes it must
-	// hear from. Both must happen before the empty entry below is appended,
-	// because the safeguard is what stops it committing.
+	// Leased modes: start the new-leader safeguard, and decide whether it may
+	// take its shortcut. Both must happen before the empty entry below is
+	// appended, because the safeguard is what stops it committing.
 	if r.readOnly.usesReadLeases() {
 		// One lease duration plus drift: every lease was requested before this
 		// election, so none can outlast that.
 		r.readOnly.safeguard.start(
 			r.readOnly.readLeaseDuration + _SAFEGUARD_CLOCK_DRIFT_MICROS)
-		r.scanUnappliedConfChanges()
+		r.readOnly.safeguard.noShortcut = !r.settledAtElection()
 		for id := range candidateConfirmed {
 			r.readOnly.safeguard.confirmAtTerm(id)
 		}
@@ -1719,7 +1741,7 @@ func stepLeader(r *raft, m pb.Message) error {
 		}
 
 		if r.readOnly.usesReadLeases() {
-			_, removed := confChangeNodes(m.Entries)
+			removed := confChangeRemovals(m.Entries)
 
 			// GrantLeases: a node must not leave the configuration while it holds a
 			// read lease. Once removed it is unreachable to the leader, but keeps
@@ -1744,6 +1766,7 @@ func stepLeader(r *raft, m pb.Message) error {
 			}
 		}
 
+		oldPendingConfIndex := r.pendingConfIndex
 		for i := range m.Entries {
 			e := &m.Entries[i]
 			var cc pb.ConfChangeI
@@ -1779,12 +1802,19 @@ func stepLeader(r *raft, m pb.Message) error {
 					m.Entries[i] = pb.Entry{Type: pb.EntryNormal}
 				} else {
 					r.pendingConfIndex = r.raftLog.lastIndex() + uint64(i) + 1
+					// Membership is unsettled from here until the application has
+					// applied this entry: the leader holds no lease of its own.
+					r.readOnly.dropSelfLease()
 					traceChangeConfEvent(cc, r)
 				}
 			}
 		}
 
 		if !r.appendEntry(m.Entries...) {
+			// Nothing was appended, so no conf change is pending. Left past
+			// lastIndex, pendingConfIndex would keep membership unsettled, and
+			// read leases paused, until other entries filled the gap.
+			r.pendingConfIndex = oldPendingConfIndex
 			return ErrProposalDropped
 		}
 		r.bcastAppend()
@@ -2290,6 +2320,17 @@ func stepFollower(r *raft, m pb.Message) error {
 			return nil
 		}
 		if r.readOnly.option == ReadOnlyGrantLeases {
+			// Only this node's own reads are served from its lease. A read another
+			// node forwarded here (its leader is stale) goes on to our leader, From
+			// intact, which answers that node directly. A give-up replay's m.Index
+			// was computed against the requester's lease, not ours (SAFE-5).
+			if m.From != None && m.From != r.id {
+				m.To = r.lead
+				r.send(m)
+				r.readOnly.markReadIndexStat(false)
+				r.maybeAskForReadLease()
+				return nil
+			}
 			// A switch hint only covers this term if this term's leader wrote the
 			// register it came from: after a switch reboot, a deposed leader's
 			// lower write can land first (SAFE-1). The switch carries the term in
@@ -2315,9 +2356,11 @@ func stepFollower(r *raft, m pb.Message) error {
 					(m.Commit == 0 || m.Commit <= r.raftLog.committed)) ||
 					// Used for delayed read index requests- m.Index is set to the original commitVal set below
 					(m.Index != 0 && m.Index <= r.raftLog.committed) {
-					resp := r.responseToReadIndexReq(m, r.raftLog.committed)
-					resp.From = r.id
-					r.send(resp)
+					// Only local reads reach here, so this records a read state and
+					// returns no message.
+					if resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.To != None {
+						r.send(resp)
+					}
 					r.readOnly.markReadIndexStat(true)
 					r.logger.Debugf("%x served read index request locally with lease (lease acked index: %d, commit: %d)", r.id, ackedIndex, r.raftLog.committed)
 				} else { // In this case, we haven't caught up yet; try to hold onto this for a bit.

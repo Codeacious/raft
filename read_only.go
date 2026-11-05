@@ -404,14 +404,10 @@ type newLeaderSafeguard struct {
 	windowMicros uint64
 	// confirmedAtTerm records peers heard from at the current term.
 	confirmedAtTerm map[uint64]struct{}
-	// unappliedConfNodes contains node ids named by unapplied conf-change
-	// entries in the log at election time. The safeguard shortcut must wait for
-	// acks from these nodes as well as every node in the current configuration.
-	unappliedConfNodes map[uint64]struct{}
-	// scanFailed indicates that the election-time log tail scan to populate
-	// unappliedConfNodes failed, so it may be incomplete.
-	// Disables the safeguard shortcut entirely.
-	scanFailed bool
+	// noShortcut is set at election when this leader's membership was not
+	// settled (raft.settledAtElection): trk.Progress may then miss a node that
+	// holds a prior-term lease, so the safeguard runs its full window.
+	noShortcut bool
 }
 
 func newReadOnly(option ReadOnlyOption, duration uint64,
@@ -431,8 +427,7 @@ func newReadOnly(option ReadOnlyOption, duration uint64,
 			grantBanned:          make(map[uint64]struct{}),
 		},
 		safeguard: newLeaderSafeguard{
-			confirmedAtTerm:    make(map[uint64]struct{}),
-			unappliedConfNodes: make(map[uint64]struct{}),
+			confirmedAtTerm: make(map[uint64]struct{}),
 		},
 		readLeaseDuration:  duration,
 		maxReadLeases:      maxleases,
@@ -541,6 +536,11 @@ func (ro *readOnly) banGrants(ids []uint64) (holder uint64, found bool) {
 // go through read-index rounds.
 func (ro *readOnly) banSelfLease() {
 	ro.leader.selfLeaseBanned = true
+	ro.dropSelfLease()
+}
+
+// dropSelfLease drops the lease this leader holds and any pending renewal.
+func (ro *readOnly) dropSelfLease() {
 	ro.leader.pendingSelfStart = 0
 	ro.leader.pendingSelfRound = 0
 	ro.heldLease = nil
@@ -692,11 +692,16 @@ func (l *leaderLeaseState) leaseRoundInFlight() bool {
 
 // leaseProposalUrgent reports whether any pending renewal or follower request
 // is for a lease with less than _LEASE_EXPEDITE_THRESHOLD_MICROS left, or no
-// lease at all.
-func (ro *readOnly) leaseProposalUrgent() bool {
+// lease at all. Held follower requests count only if grantsInstallable: while
+// membership is unsettled no round can install them, and expediting one would
+// send round after round.
+func (ro *readOnly) leaseProposalUrgent(grantsInstallable bool) bool {
 	if ro.leader.pendingSelfStart != 0 &&
 		ro.microsUntilHeldLeaseExpired() < _LEASE_EXPEDITE_THRESHOLD_MICROS {
 		return true
+	}
+	if !grantsInstallable {
+		return false
 	}
 	for id := range ro.leader.pendingGrants {
 		if ro.microsUntilGrantedLeaseExpired(id) < _LEASE_EXPEDITE_THRESHOLD_MICROS {

@@ -178,9 +178,19 @@ type Node interface {
 	Advance()
 	// ApplyConfChange applies a config change (previously passed to
 	// ProposeConfChange) to the node. This must be called whenever a config
-	// change is observed in Ready.CommittedEntries, except when the app decides
-	// to reject the configuration change (i.e. treats it as a noop instead), in
-	// which case it must not be called.
+	// change is observed in Ready.CommittedEntries. In the non-leased
+	// read-only options, an app that rejects a change (treats it as a noop)
+	// may instead skip the call.
+	//
+	// In the leased read-only options it must be called once for every config
+	// change observed, in log order, rejected ones included: read leases stay
+	// paused until every observed change has been through it. To reject a
+	// change, call it with pb.ConfChange{} (NodeID = None, as etcd does), a
+	// noop outside a joint config. In a joint config that call panics and an
+	// empty ConfChangeV2 leaves the joint config (upstream 5eb0a8c), but the
+	// only change raft lets arrive while joint is the leave-joint, and
+	// rejecting a leave-joint is not supported. DisableConfChangeValidation
+	// lifts that guarantee, so it is not supported with read leases.
 	//
 	// Returns an opaque non-nil ConfState protobuf which must be recorded in
 	// snapshots.
@@ -409,6 +419,7 @@ func (n *node) run() {
 			r.Step(m)
 		case cc := <-n.confc:
 			_, okBefore := r.trk.Progress[r.id]
+			r.confApplied++
 			cs := r.applyConfChange(cc)
 			// If the node was removed, block incoming proposals. Note that we
 			// only do this if the node was in the config before. Nodes may be

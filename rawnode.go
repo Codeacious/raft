@@ -107,9 +107,15 @@ func (rn *RawNode) ProposeConfChange(cc pb.ConfChangeI) error {
 }
 
 // ApplyConfChange applies a config change to the local node. The app must call
-// this when it applies a configuration change, except when it decides to reject
-// the configuration change, in which case no call must take place.
+// this when it applies a configuration change. In the non-leased read-only
+// options, an app that rejects a change may instead skip the call.
+//
+// In the leased read-only options it must be called once for every conf-change
+// entry handed out, in log order, rejected ones included: read leases stay
+// paused until every handed-out change has been through it. Reject with
+// pb.ConfChange{} as described on Node.ApplyConfChange.
 func (rn *RawNode) ApplyConfChange(cc pb.ConfChangeI) *pb.ConfState {
+	rn.raft.confApplied++
 	cs := rn.raft.applyConfChange(cc.AsV2())
 	return &cs
 }
@@ -437,6 +443,11 @@ func (rn *RawNode) acceptReady(rd Ready) {
 		ents := rd.CommittedEntries
 		index := ents[len(ents)-1].Index
 		rn.raft.raftLog.acceptApplying(index, entsSize(ents), rn.applyUnstableEntries())
+		for i := range ents {
+			if ents[i].Type == pb.EntryConfChange || ents[i].Type == pb.EntryConfChangeV2 {
+				rn.raft.confHandedOut++
+			}
+		}
 	}
 
 	traceReady(rn.raft)
