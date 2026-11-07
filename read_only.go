@@ -600,6 +600,21 @@ func (ro *readOnly) canGrantLeaseSlot(id uint64) bool {
 	return ro.getNumGrantedLeases() < ro.maxReadLeases || ro.hasActiveGrantedLease(id)
 }
 
+// renewalPinsCommit reports whether an ask with leaseId renews a live grant to
+// id whose AckedIndex is more than the catch-up margin below quorumIndex. The
+// clamp must honor that grant until it expires, but renewing it would hold
+// commit below the quorum for another lease, indefinitely if the holder never
+// catches up (LIVE-2). An ask from a new incarnation is not a renewal: the old
+// grant's AckedIndex is frozen (ackMatchesGrant), and the new grant replaces it.
+func (ro *readOnly) renewalPinsCommit(id uint64, leaseId uint64, quorumIndex uint64) bool {
+	if !ro.hasActiveGrantedLease(id) {
+		return false
+	}
+	rl := ro.getGrantedLease(id)
+	return leaseIncarnation(rl.LeaseId) == leaseIncarnation(leaseId) &&
+		quorumIndex > rl.AckedIndex+uint64(ro.leaseCatchupMargin)
+}
+
 // microsUntilHeldLeaseExpired returns how long this node's own lease has left,
 // or 0 if it has none. Clears an expired lease as a side effect.
 func (ro *readOnly) microsUntilHeldLeaseExpired() uint64 {

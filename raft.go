@@ -1285,6 +1285,25 @@ func (r *raft) tickHeartbeat() {
 		releasePendingReadIndexMessages(r)
 		r.bcastAppend()
 	}
+
+	r.maybeCommitClamped()
+}
+
+// maybeCommitClamped re-runs maybeCommit while the read-lease clamp holds
+// commit below the quorum index (GrantLeases, after the term's first commit).
+// A grant that stops pinning commit when it expires drives no commit by
+// itself: maybeCommit runs on acks, and admission and lease lookups reap
+// expired grants silently. Called from tickHeartbeat, so an idle group's
+// write commits within a tick of the expiry, and before lease admission, so
+// check 5 judges an asker against the commit index the remaining grants
+// allow rather than a stale clamped one (LIVE-4; the LIVE-2 residual).
+func (r *raft) maybeCommitClamped() {
+	if r.readOnly.option == ReadOnlyGrantLeases &&
+		r.committedEntryInCurrentTerm() &&
+		r.raftLog.committed < r.trk.Committed() &&
+		r.maybeCommit() {
+		r.bcastAppend()
+	}
 }
 
 func (r *raft) becomeFollower(term uint64, lead uint64) {
@@ -2164,10 +2183,12 @@ func stepLeader(r *raft, m pb.Message) error {
 		}
 	case pb.MsgAskReadLease:
 		r.logger.Infof("Got MsgAskReadLease from %x at leader (leaseId: %d)", m.From, m.LogTerm)
+		// Check 5 reads committed: bring it up to date with expired grants first.
+		r.maybeCommitClamped()
 		// trk.Progress holds learners as well as voters, but granting leases to
 		// learners is intentional.
 		pr := r.trk.Progress[m.From]
-		// Requirements 1-6 are checked only here; grantProposalsCoveredBy
+		// Requirements 1-6 (and 5b) are checked only here; grantProposalsCoveredBy
 		// re-checks only 6.
 		if r.readOnly.option != ReadOnlyGrantLeases || // TODO: Maybe log if this specific condition fails?
 			r.Term != m.Term || // 1. The request is for the current term.
@@ -2175,6 +2196,9 @@ func stepLeader(r *raft, m pb.Message) error {
 			pr == nil || // 3. The asker is still in the current configuration.
 			r.readOnly.leader.isGrantBanned(m.From) || // 4. The asker is not being removed from the configuration.
 			r.raftLog.committed > m.Index+uint64(r.readOnly.leaseCatchupMargin) || // 5. The follower has an up-to-date log.
+			// 5b. A holder's renewal: its grant is not pinning commit beyond the
+			// margin. 5 cannot catch this, as the holder clamps committed itself.
+			r.readOnly.renewalPinsCommit(m.From, m.LogTerm, r.trk.Committed()) ||
 			!r.readOnly.canGrantLeaseSlot(m.From) { // 6. A lease slot is free, or this node already holds one.
 			r.sendReadLeaseResp(m.From, m.LogTerm, nil)
 			return nil
@@ -2203,8 +2227,18 @@ func stepLeader(r *raft, m pb.Message) error {
 			return nil
 		}
 		// Term 0 is a switch credit injected by the application, which vouches
-		// for the holder's reads whatever its incarnation. A holder's own
-		// answer counts only from the incarnation that asked for this grant.
+		// for the holder's reads whatever its incarnation, but only in the term
+		// the switch register answered in (LogTerm, 32 bits as the switch
+		// carries it). The register's index rises only within a term; a newer
+		// term's write may lower it, so a credit from another term's register
+		// promises nothing about the stamps this term's reads will use. A
+		// holder's own answer counts only from the incarnation that asked for
+		// this grant.
+		if m.Term == 0 && uint32(m.LogTerm) != uint32(r.Term) {
+			r.logger.Infof("ignoring switch credit for %x: register term %d is not term %d",
+				m.From, m.LogTerm, r.Term)
+			return nil
+		}
 		if m.Term != 0 && !r.readOnly.ackMatchesGrant(m.From, m.LogTerm) {
 			r.logger.Infof("ignoring MsgAskAckIndexResp from %x: incarnation %x did not ask for its grant",
 				m.From, m.LogTerm)

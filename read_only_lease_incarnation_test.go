@@ -289,8 +289,41 @@ func TestAskAckIndexRespIncarnation(t *testing.T) {
 		Index: base + 1, LogTerm: inc}))
 	require.Equal(t, base+1, acked(), "the asking incarnation's answer counts")
 
-	require.NoError(t, r1.Step(pb.Message{From: 2, To: 1, Type: pb.MsgAskAckIndexResp, Index: base + 2}))
+	require.NoError(t, r1.Step(pb.Message{From: 2, To: 1, Type: pb.MsgAskAckIndexResp,
+		Index: base + 2, LogTerm: r1.Term}))
 	require.Equal(t, base+2, acked(), "a Term-0 switch credit counts")
+}
+
+// TestSwitchCreditTermGate: a Term-0 switch credit counts only in the term
+// the switch register answered in (LogTerm), compared modulo 2^32 as the switch
+// carries it. The register's index rises only within a term, so a credit from
+// another term's register says nothing about this term's stamps.
+func TestSwitchCreditTermGate(t *testing.T) {
+	tests := []struct {
+		name    string
+		logTerm func(r *raft) uint64
+		counts  bool
+	}{
+		{"this term", func(r *raft) uint64 { return r.Term }, true},
+		{"this term mod 2^32", func(r *raft) uint64 { return r.Term + 1<<32 }, true},
+		{"an earlier term", func(r *raft) uint64 { return r.Term - 1 }, false},
+		{"a later term", func(r *raft) uint64 { return r.Term + 1 }, false},
+		{"no term", func(r *raft) uint64 { return 0 }, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rs, _ := incarnationTestGroup(t, false)
+			r1 := rs[1]
+			base := r1.readOnly.getGrantedLease(2).AckedIndex
+			require.NoError(t, r1.Step(pb.Message{From: 2, To: 1, Type: pb.MsgAskAckIndexResp,
+				Index: base + 1, LogTerm: tt.logTerm(r1)}))
+			want := base
+			if tt.counts {
+				want = base + 1
+			}
+			require.Equal(t, want, r1.readOnly.getGrantedLease(2).AckedIndex)
+		})
+	}
 }
 
 // TestLeaseIdKeepsIncarnationOnWrap: the lease-id counter wraps within the
