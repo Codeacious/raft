@@ -317,6 +317,14 @@ type Config struct {
 
 	// raft state tracer
 	TraceLogger TraceLogger
+
+	// CommitTrace, if set, is called on the leader for each replication event
+	// that can move the commit index (see CommitTraceKind), so commit latency
+	// can be analysed offline: the quorum's acks vs every follower's. It runs
+	// on the goroutine stepping raft, so it must be cheap, must not block and
+	// must not call back into raft. nil (the default) costs a nil check per
+	// event site.
+	CommitTrace func(CommitTraceEvent)
 }
 
 func (c *Config) validate() error {
@@ -487,6 +495,7 @@ type raft struct {
 	pendingReadIndexMessages []pb.Message
 
 	traceLogger TraceLogger
+	commitTrace func(CommitTraceEvent)
 }
 
 func newRaft(c *Config) *raft {
@@ -519,6 +528,7 @@ func newRaft(c *Config) *raft {
 		disableConfChangeValidation: c.DisableConfChangeValidation,
 		stepDownOnRemoval:           c.StepDownOnRemoval,
 		traceLogger:                 c.TraceLogger,
+		commitTrace:                 c.CommitTrace,
 	}
 
 	traceInitState(r)
@@ -816,6 +826,9 @@ func (r *raft) grantProposalsCoveredBy(round uint64) {
 		}
 		lease := r.readOnly.grantNewLease(id, pg.leaseId,
 			r.readOnly.grantAckedIndex(id, pg.leaseId, pg.askedIndex), r.raftLog.committed)
+		if lease != nil {
+			r.traceCommitEvent(CommitTraceAcked, CommitTraceSourceGrant, id, lease.AckedIndex)
+		}
 		r.sendReadLeaseResp(id, pg.leaseId, lease)
 	}
 }
@@ -1124,6 +1137,9 @@ func confChangeRemovals(ents []pb.Entry) (removed []uint64) {
 // only be called in StateLeader.
 func (r *raft) maybeCommit() bool {
 	defer traceCommit(r)
+	if r.commitTrace != nil {
+		defer r.traceCommitAdvance(r.raftLog.committed)
+	}
 	quorumCommitIndex := r.trk.Committed()
 
 	// A new leader commits nothing, not even its empty entry (which would also
@@ -1209,6 +1225,7 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 
 	// use latest "last" index after truncate/append
 	li = r.raftLog.append(es...)
+	r.traceCommitEvent(CommitTraceAppend, CommitTraceSourceNone, r.id, li)
 	// The leader needs to self-ack the entries just appended once they have
 	// been durably persisted (since it doesn't send an MsgApp to itself). This
 	// response message will be added to msgsAfterAppend and delivered back to
@@ -2011,11 +2028,16 @@ func stepLeader(r *raft, m pb.Message) error {
 			// equals pr.Match we know we don't m.Index+1 in our log, so moving
 			// back to replicating state is not useful; besides pr.PendingSnapshot
 			// would prevent it.
-			if pr.MaybeUpdate(m.Index) || (pr.Match == m.Index && pr.State == tracker.StateProbe) {
+			matched := pr.MaybeUpdate(m.Index)
+			if matched {
+				// m.From may be this leader: its self-ack (see appendEntry).
+				r.traceCommitEvent(CommitTraceMatch, CommitTraceSourceNone, m.From, pr.Match)
+			}
+			if matched || (pr.Match == m.Index && pr.State == tracker.StateProbe) {
 				// Match advances from any ack; the grant's AckedIndex only from
 				// the incarnation that asked for it (LogTerm, see sendAppResp).
 				if r.readOnly.option == ReadOnlyGrantLeases && r.readOnly.ackMatchesGrant(m.From, m.LogTerm) {
-					r.readOnly.updateGrantedAckedIndex(m.From, m.Index)
+					r.raiseGrantedAckedIndex(m.From, m.Index, CommitTraceSourceAppResp)
 				}
 
 				switch {
@@ -2246,7 +2268,11 @@ func stepLeader(r *raft, m pb.Message) error {
 		}
 		oldIndex := rl.AckedIndex
 		minAckIndex := r.readOnly.getMinGrantedAckedIndex()
-		r.readOnly.updateGrantedAckedIndex(m.From, m.Index)
+		src := CommitTraceSourceAckIndexResp
+		if m.Term == 0 {
+			src = CommitTraceSourceSwitchCredit
+		}
+		r.raiseGrantedAckedIndex(m.From, m.Index, src)
 		if m.Term == 0 {
 			r.readOnly.readLeaseStats.TimesCreditAccepted++
 		}
