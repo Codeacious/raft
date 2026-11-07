@@ -137,7 +137,9 @@ func TestSwitchHintGate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := newSwitchHintTestRaft(t, tt.ackedIndex)
+			before := r.readOnly.readLeaseStats
 			stepSwitchHintRead(t, r, tt.hint)
+			after := r.readOnly.readLeaseStats
 
 			msgs := r.readMessages()
 			held := r.readIndexDelayer.heldCount()
@@ -158,6 +160,21 @@ func TestSwitchHintGate(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("got %s, want %s", got, tt.want)
+			}
+			// EXP-6: the stats etcd exports tell the three outcomes apart. A
+			// held read is decided (counted as got/used) only when released.
+			stats := [3]uint64{
+				after.TimesGotReadQuery - before.TimesGotReadQuery,
+				after.TimesReadLeaseUsed - before.TimesReadLeaseUsed,
+				after.TimesReadHeld - before.TimesReadHeld,
+			}
+			wantStats := map[string][3]uint64{
+				"served":    {1, 1, 0},
+				"held":      {0, 0, 1},
+				"forwarded": {1, 0, 0},
+			}[tt.want]
+			if stats != wantStats {
+				t.Errorf("(got, used, held) stats = %v, want %v", stats, wantStats)
 			}
 		})
 	}

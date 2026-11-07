@@ -104,8 +104,9 @@ func (s Status) MarshalJSON() ([]byte, error) {
 		j = j[:len(j)-1] + "},"
 	}
 
-	j += fmt.Sprintf(`"leadtransferee":"%x","readLeaseStats":{"timesReadLeaseUsed":%d,"timesGotReadQuery":%d}}`,
-		s.LeadTransferee, s.ReadLeaseStats.TimesReadLeaseUsed, s.ReadLeaseStats.TimesGotReadQuery)
+	j += fmt.Sprintf(`"leadtransferee":"%x","readLeaseStats":{"timesReadLeaseUsed":%d,"timesGotReadQuery":%d,"timesReadHeld":%d,"timesCreditAccepted":%d}}`,
+		s.LeadTransferee, s.ReadLeaseStats.TimesReadLeaseUsed, s.ReadLeaseStats.TimesGotReadQuery,
+		s.ReadLeaseStats.TimesReadHeld, s.ReadLeaseStats.TimesCreditAccepted)
 	return []byte(j), nil
 }
 

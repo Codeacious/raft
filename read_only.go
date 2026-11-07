@@ -124,9 +124,24 @@ func (l leaseEchoIndexer) AckedIndex(id uint64) (quorum.Index, bool) {
 	return quorum.Index(r), ok
 }
 
+// ReadLeaseStats counts follower reads under ReadOnlyGrantLeases, per readOnly
+// instance (a reset zeroes them).
 type ReadLeaseStats struct {
+	// TimesReadLeaseUsed counts reads served from this node's lease, at once
+	// or after a hold.
 	TimesReadLeaseUsed uint64
-	TimesGotReadQuery  uint64
+	// TimesGotReadQuery counts reads decided: served from the lease or
+	// forwarded to the leader. A held read counts once, when its hold ends.
+	TimesGotReadQuery uint64
+	// TimesReadHeld counts reads held for commit to catch up before being
+	// decided (EXP-6): a held read then served counts in TimesReadLeaseUsed
+	// too, but waited up to the hold time first.
+	TimesReadHeld uint64
+	// TimesCreditAccepted (leader side) counts switch credits (Term-0
+	// MsgAskAckIndexResp) that passed the term check and found a grant to
+	// raise (EXP-6, review tack-08 F6). One the application fed but raft
+	// dropped (no grant, another term) isn't counted.
+	TimesCreditAccepted uint64
 }
 
 func (h *readLeaseHeap) Len() int { return len(h.items) }
@@ -1000,6 +1015,11 @@ func newReadIndexDelayer() *readIndexDelayer {
 		delayedReadsHandlerLock: sync.Mutex{},
 		holdMicros:              _READ_INDEX_LOCAL_HOLD_DURATION_MICROS,
 	}
+}
+
+// markReadHeldStat records that a read was held for commit to catch up.
+func (ro *readOnly) markReadHeldStat() {
+	ro.readLeaseStats.TimesReadHeld++
 }
 
 func (ro *readOnly) markReadIndexStat(usedReadLease bool) {

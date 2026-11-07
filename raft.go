@@ -2247,6 +2247,9 @@ func stepLeader(r *raft, m pb.Message) error {
 		oldIndex := rl.AckedIndex
 		minAckIndex := r.readOnly.getMinGrantedAckedIndex()
 		r.readOnly.updateGrantedAckedIndex(m.From, m.Index)
+		if m.Term == 0 {
+			r.readOnly.readLeaseStats.TimesCreditAccepted++
+		}
 		if oldIndex == minAckIndex && r.maybeCommit() {
 			releasePendingReadIndexMessages(r)
 			r.bcastAppend()
@@ -2402,6 +2405,7 @@ func stepFollower(r *raft, m pb.Message) error {
 					if !m.Reject &&
 						(commitVal-r.raftLog.committed) <= _READ_INDEX_LOCAL_HOLD_LOG_THRESHOLD {
 						r.readIndexDelayer.addDelayedReadIndexReq(m, commitVal)
+						r.readOnly.markReadHeldStat()
 					} else {
 						m.To = r.lead
 						r.send(m)

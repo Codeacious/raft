@@ -315,15 +315,28 @@ func TestSwitchCreditTermGate(t *testing.T) {
 			rs, _ := incarnationTestGroup(t, false)
 			r1 := rs[1]
 			base := r1.readOnly.getGrantedLease(2).AckedIndex
+			accepted := r1.readOnly.readLeaseStats.TimesCreditAccepted
 			require.NoError(t, r1.Step(pb.Message{From: 2, To: 1, Type: pb.MsgAskAckIndexResp,
 				Index: base + 1, LogTerm: tt.logTerm(r1)}))
-			want := base
+			want, wantAccepted := base, accepted
 			if tt.counts {
-				want = base + 1
+				want, wantAccepted = base+1, accepted+1
 			}
 			require.Equal(t, want, r1.readOnly.getGrantedLease(2).AckedIndex)
+			// EXP-6 (review tack-08 F6): only a credit raft acted on counts.
+			require.Equal(t, wantAccepted, r1.readOnly.readLeaseStats.TimesCreditAccepted)
 		})
 	}
+
+	// A credit for a node holding no grant (4 holds none) raises nothing and
+	// isn't counted: the case an application's fed-credit count can't see.
+	rs, _ := incarnationTestGroup(t, false)
+	r1 := rs[1]
+	require.Nil(t, r1.readOnly.getGrantedLease(4))
+	accepted := r1.readOnly.readLeaseStats.TimesCreditAccepted
+	require.NoError(t, r1.Step(pb.Message{From: 4, To: 1, Type: pb.MsgAskAckIndexResp,
+		Index: 100, LogTerm: r1.Term}))
+	require.Equal(t, accepted, r1.readOnly.readLeaseStats.TimesCreditAccepted)
 }
 
 // TestLeaseIdKeepsIncarnationOnWrap: the lease-id counter wraps within the
