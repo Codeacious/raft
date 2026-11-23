@@ -68,6 +68,22 @@ func IsLocalMsgTarget(id uint64) bool {
 	return id == LocalAppendThread || id == LocalApplyThread
 }
 
+// IsRedundantAckAsk reports whether m is a MsgAskAckIndex the leader marked
+// redundant: an append covering the ask's cutoff is already in flight to the
+// holder, and the holder's grant has caught up with every ack it has sent. The
+// holder's answer would reach the leader no earlier than that append's
+// response, which raises its acked index at least as far
+// (askReadLeaseHoldersForAckIndex).
+//
+// The mark is Reject = true, a field MsgAskAckIndex has no other use for. The
+// application may drop a marked ask instead of sending it, after using it for
+// anything else it does with asks (etcd mirrors asks to the switch in assist
+// mode). Dropping one can't break safety, since asks only ever loosen the
+// commit clamp. A holder that receives a marked ask answers it as usual.
+func IsRedundantAckAsk(m pb.Message) bool {
+	return m.Type == pb.MsgAskAckIndex && m.Reject
+}
+
 // voteResponseType maps vote and prevote message types to their corresponding responses.
 func voteRespMsgType(msgt pb.MessageType) pb.MessageType {
 	switch msgt {

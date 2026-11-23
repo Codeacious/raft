@@ -973,22 +973,53 @@ func (r *raft) appliedSnap(snap *pb.Snapshot) {
 // askReadLeaseHoldersForAckIndex sends MsgAskAckIndex to every lease holder
 // whose acked index is below cutoffIndex, at most once per
 // _ACK_INDEX_ASK_INTERVAL_MICROS per holder.
+//
+// An ask whose answer can't help is marked redundant (Reject = true, read with
+// IsRedundantAckAsk): an append covering cutoffIndex is in flight to the holder
+// and its grant has caught up with everything it has acked
+// (appendInFlightCovers). The holder answers with an index it has appended,
+// after the responses to the appends it stepped first, so that append's
+// response reaches this leader no later and raises the grant at least as far.
+// The application may drop a marked ask instead of sending it; etcd does, after
+// mirroring it to the switch in assist mode. A marked ask is stamped like any
+// other, so a mirror keeps today's rate, but an unmarked ask is due at once
+// after a marked one: a dropped ask never delays a needed one.
 func (r *raft) askReadLeaseHoldersForAckIndex(cutoffIndex uint64) {
 	r.readOnly.leader.grantedLeases.CleanupExpiredLeases()
 	now := nowMicros()
 	r.readOnly.leader.grantedLeases.Range(func(id uint64, rl *ReadLease) bool {
+		if rl.AckedIndex >= cutoffIndex {
+			return true
+		}
+		redundant := appendInFlightCovers(r.trk.Progress[id], rl.AckedIndex, cutoffIndex)
 		// Only ask if we haven't asked recently.
-		if rl.AckedIndex < cutoffIndex &&
-			rl.LastAckAsked < now && now-rl.LastAckAsked >= _ACK_INDEX_ASK_INTERVAL_MICROS {
+		due := rl.LastAckAsked < now && now-rl.LastAckAsked >= _ACK_INDEX_ASK_INTERVAL_MICROS
+		if due || (rl.LastAckAskRedundant && !redundant) {
 			r.send(pb.Message{
-				To:   id,
-				From: r.id,
-				Type: pb.MsgAskAckIndex,
+				To:     id,
+				From:   r.id,
+				Type:   pb.MsgAskAckIndex,
+				Reject: redundant,
 			})
 			rl.LastAckAsked = now
+			rl.LastAckAskRedundant = redundant
 		}
 		return true
 	})
+}
+
+// appendInFlightCovers reports whether a lease holder's only shortfall against
+// cutoff is an append already in flight to it, so asking it for its ack index
+// is redundant (askReadLeaseHoldersForAckIndex). In StateReplicate the entries
+// in (Match, Next) have been sent and not yet acked, so Match < cutoff < Next
+// means an append covering cutoff is on its way. acked >= Match means the grant
+// has caught up with every ack the holder has sent, so that append's response
+// is what raises it; a grant still below Match (just installed, or from a new
+// incarnation) is asked as before, since no pending response would raise it.
+// Probe and Snapshot holders are asked as before.
+func appendInFlightCovers(pr *tracker.Progress, acked, cutoff uint64) bool {
+	return pr != nil && pr.State == tracker.StateReplicate &&
+		pr.Match < cutoff && cutoff < pr.Next && acked >= pr.Match
 }
 
 // newLeaderSafeguardPassed reports whether the new-leader safeguard has lifted,
@@ -2490,6 +2521,9 @@ func stepFollower(r *raft, m pb.Message) error {
 			r.logger.Warningf("%x received unexpected MsgAskAckIndex from %x (read-only option %d)", r.id, m.From, r.readOnly.option)
 			return nil
 		}
+		// m.Reject (the leader's redundancy mark, IsRedundantAckAsk) is not
+		// read here: a marked ask that reaches a holder is answered like any
+		// other.
 		resp := pb.Message{To: m.From, From: r.id, Type: pb.MsgAskAckIndexResp, Index: 0,
 			LogTerm: r.readOnly.incarnationID()}
 		if r.readOnly.hasActiveHeldLease() {

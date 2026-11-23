@@ -69,13 +69,19 @@ type ReadState struct {
 }
 
 type ReadLease struct {
-	LeaseId      uint64
-	NodeId       uint64
-	LogIndex     uint64
-	StartTime    uint64
-	Duration     uint64
-	AckedIndex   uint64
+	LeaseId    uint64
+	NodeId     uint64
+	LogIndex   uint64
+	StartTime  uint64
+	Duration   uint64
+	AckedIndex uint64
+	// LastAckAsked is the leader-side rate limit for MsgAskAckIndex; in-memory
+	// only, never marshalled.
 	LastAckAsked uint64
+	// LastAckAskRedundant says whether the ask stamped in LastAckAsked was
+	// marked redundant (IsRedundantAckAsk). The application may have dropped
+	// it, so it doesn't hold back an unmarked ask. In-memory only.
+	LastAckAskRedundant bool
 }
 
 type heapItem struct {
